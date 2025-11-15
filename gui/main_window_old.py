@@ -1466,9 +1466,9 @@ class MainWindow(QMainWindow):
     
     def show_about(self):
         """Show about dialog"""
-        QMessageBox.about(self, "About Vion Flux Video Converter",
+        QMessageBox.about(self, "About Vion Pulse Video Converter",
                          "<h2>Vion Pulse Video Converter</h2>"
-                         "<p>A simple video transcoding application built with Python and FFmpeg.</p>"
+                         "<p>An advanced video transcoding application built with Python and FFmpeg.</p>"
                          "<p>Version 1.0.0</p>"
                          "<p>©2025 NGNT Creations</p>")
     
