@@ -1,0 +1,107 @@
+﻿import sys
+from PyQt6.QtWidgets import QApplication
+from gui.main_window_old import MainWindow
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    # Apply a lighter blue theme
+    app.setStyleSheet("""
+        QWidget {
+            background-color: #f0f8ff;
+            color: #000000;
+            font-family: Arial, sans-serif;
+        }
+        QMainWindow {
+            background-color: #f0f8ff;
+        }
+        QPushButton {
+            background-color: #add8e6;
+            border: 1px solid #4682b4;
+            padding: 5px;
+            border-radius: 3px;
+        }
+        QPushButton:hover {
+            background-color: #87ceeb;
+        }
+        QPushButton:pressed {
+            background-color: #4682b4;
+        }
+        QComboBox {
+            background-color: #ffffff;
+            border: 1px solid #4682b4;
+            padding: 2px;
+        }
+        QSpinBox {
+            background-color: #ffffff;
+            border: 1px solid #4682b4;
+        }
+        QLineEdit {
+            background-color: #ffffff;
+            border: 1px solid #4682b4;
+        }
+        QPlainTextEdit {
+            background-color: #ffffff;
+            border: 1px solid #4682b4;
+        }
+        QGroupBox {
+            font-weight: bold;
+            border: 2px solid #4682b4;
+            border-radius: 5px;
+            margin-top: 1ex;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 5px 0 5px;
+        }
+        QTabWidget::pane {
+            border: 1px solid #4682b4;
+        }
+        QTabBar::tab {
+            background-color: #add8e6;
+            border: 1px solid #4682b4;
+            padding: 5px;
+        }
+        QTabBar::tab:selected {
+            background-color: #87ceeb;
+        }
+        QProgressBar {
+            border: 1px solid #4682b4;
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background-color: #4682b4;
+        }
+        QCheckBox {
+            background-color: #f0f8ff;
+            color: #000000;
+        }
+        QCheckBox::indicator {
+            width: 13px;
+            height: 13px;
+            border: 1px solid #4682b4;
+            background-color: #ffffff;
+        }
+        QCheckBox::indicator:checked {
+            background-color: #4682b4;
+        }
+        QPushButton:disabled {
+            background-color: #cccccc;
+            color: #888888;
+        }
+        QComboBox:disabled {
+            background-color: #e0e0e0;
+            color: #888888;
+        }
+        QSpinBox:disabled {
+            background-color: #e0e0e0;
+            color: #888888;
+        }
+        QLineEdit:disabled {
+            background-color: #e0e0e0;
+            color: #888888;
+        }
+    """)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())

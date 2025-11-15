@@ -1,0 +1,43 @@
+﻿import QtQuick
+import Qt5Compat.GraphicalEffects
+
+Item {
+ id: root
+ width:360
+ height:90
+
+ // Theme-driven properties
+ property url sourcePath: ""
+ property color color1: "#52FFF5"
+ property color color2: "#E6B35C"
+
+ // Base image used as alpha mask
+ Image {
+ id: base
+ anchors.fill: parent
+ source: root.sourcePath
+ fillMode: Image.PreserveAspectFit
+ visible: false // hidden; used only as maskSource
+ smooth: true
+ mipmap: true
+ }
+
+ // Gradient layer to tint with theme colors
+ Rectangle {
+ id: gradientLayer
+ anchors.fill: parent
+ visible: true
+ gradient: Gradient {
+ GradientStop { position:0.0; color: root.color1 }
+ GradientStop { position:1.0; color: root.color2 }
+ }
+ }
+
+ // Apply the base image alpha as a mask for the gradient
+ OpacityMask {
+ anchors.fill: parent
+ source: gradientLayer
+ maskSource: base
+ invert: false
+ }
+}

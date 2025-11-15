@@ -1,0 +1,43 @@
+﻿from PyQt6.QtCore import QObject, pyqtSignal
+from gui.bitrate import estimate_video_bitrate_from_size
+import os
+
+class BitrateEstimateWorker(QObject):
+    estimated = pyqtSignal(int, int) # video_kbps, audio_kbps
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, input_file, get_duration_fn, target_size_mb, audio_bitrate_text):
+        super().__init__()
+        self.input_file = input_file
+        self.get_duration_fn = get_duration_fn
+        self.target_size_mb = target_size_mb
+        self.audio_bitrate_text = audio_bitrate_text
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        try:
+            if not self.input_file or not os.path.exists(self.input_file):
+                self.error.emit("Select an input file first for duration.")
+                self.finished.emit()
+                return
+            duration = self.get_duration_fn(self.input_file)
+            if duration <=0:
+                self.error.emit("Could not determine input duration.")
+                self.finished.emit()
+                return
+            video_kbps, audio_kbps = estimate_video_bitrate_from_size(
+                self.input_file, self.get_duration_fn, self.target_size_mb, self.audio_bitrate_text, self._emit_log
+            )
+            self.estimated.emit(video_kbps, audio_kbps)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+    def _emit_log(self, msg: str):
+        self.log.emit(msg)

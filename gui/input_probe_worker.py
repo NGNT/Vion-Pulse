@@ -1,0 +1,81 @@
+from PyQt6.QtCore import QObject, pyqtSignal
+import os
+from typing import Optional
+from gui.probe import (
+    probe_attached_pictures,
+    get_video_duration,
+    get_subtitle_streams,
+    get_audio_streams,
+    quick_probe_field_order,
+    get_video_resolution_and_codec,
+)
+
+class InputProbeWorker(QObject):
+    """Simple worker that probes a media file off the UI thread and emits results.
+
+    Signals:
+    probed(dict): emitted with probe results
+    error(str): emitted on error
+    log(str): emit log messages
+    finished(): emitted when done
+    """
+
+    probed = pyqtSignal(object)
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    start_probe = pyqtSignal(str)
+
+    def __init__(self, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self._running = True
+        self.start_probe.connect(self.run)
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self, file_path: str) -> None:
+        # Validate input
+        if not file_path or not os.path.exists(file_path):
+            self.error.emit(f"File does not exist: {file_path}")
+            self.finished.emit()
+            return
+
+        # Run probes (these helper functions log via provided callback)
+        duration = get_video_duration(file_path, self._emit_log) or 0.0
+        size_bytes = 0
+        try:
+            size_bytes = os.path.getsize(file_path)
+        except Exception as e:
+            self._emit_log(f"size probe error: {e}")
+
+        resolution, codec = get_video_resolution_and_codec(file_path, self._emit_log)
+        attached = probe_attached_pictures(file_path, self._emit_log)
+        subtitle_display, subtitle_meta = get_subtitle_streams(file_path, self._emit_log)
+        audio_meta = get_audio_streams(file_path, self._emit_log)
+        field_order = quick_probe_field_order(file_path, self._emit_log)
+
+        result = {
+            'path': file_path,
+            'duration': duration,
+            'size_bytes': size_bytes,
+            'resolution': resolution,
+            'codec': codec,
+            'attached_pics': attached,
+            'subtitle_display': subtitle_display,
+            'subtitle_meta': subtitle_meta,
+            'audio_meta': audio_meta,
+            'field_order': field_order,
+            'has_audio': bool(audio_meta),  # Explicitly set has_audio flag
+        }
+
+        # Emit results and finish
+        self.probed.emit(result)
+        self.finished.emit()
+
+    def _emit_log(self, msg: str) -> None:
+        try:
+            self.log.emit(msg)
+        except Exception:
+            pass

@@ -1,0 +1,115 @@
+﻿import subprocess, json, re
+from typing import List, Tuple, Dict, Optional, Callable
+
+LogFn = Optional[Callable[[str], None]]
+
+def _safe_log(log_fn: LogFn, msg: str):
+    if log_fn:
+        try:
+            log_fn(msg)
+        except Exception:
+            pass
+
+def probe_attached_pictures(file_path: str, log_fn: LogFn = None) -> List[int]:
+    """Return list of global stream indices flagged as attached_pic."""
+    indices: List[int] = []
+    try:
+        cmd = ['ffprobe','-v','error','-show_entries','stream=index,codec_type,disposition','-of','json', file_path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        data = json.loads(res.stdout or '{}')
+        for s in data.get('streams', []):
+            if s.get('codec_type') == 'video':
+                disp = s.get('disposition') or {}
+                if int(disp.get('attached_pic') or0) ==1:
+                    indices.append(int(s.get('index')))
+    except Exception as e:
+        _safe_log(log_fn, f"probe_attached_pictures error: {e}")
+    return indices
+
+def get_video_duration(file_path: str, log_fn: LogFn = None) -> float:
+    """Return duration in seconds or0.0 on failure."""
+    try:
+        cmd = ['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1', file_path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        if res.returncode ==0:
+            return float(res.stdout.strip())
+    except Exception as e:
+        _safe_log(log_fn, f"get_video_duration error: {e}")
+    return 0.0
+
+def get_subtitle_streams(file_path: str, log_fn: LogFn = None) -> Tuple[List[str], List[Dict]]:
+    """Return (display_list, meta_list) where meta_list contains dicts with index and codec_name."""
+    display: List[str] = []
+    meta: List[Dict] = []
+    try:
+        cmd = ['ffprobe','-v','error','-select_streams','s','-show_entries','stream=index,codec_name:stream_tags=language','-of','json', file_path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        data = json.loads(res.stdout or '{}')
+        for s in data.get('streams', []):
+            idx = s.get('index')
+            codec = (s.get('codec_name') or '').lower()
+            lang = (s.get('tags') or {}).get('language', 'und')
+            display.append(f"Stream {idx} ({lang})")
+            meta.append({'index': idx, 'codec_name': codec})
+    except Exception as e:
+        _safe_log(log_fn, f"get_subtitle_streams error: {e}")
+    return display, meta
+
+def get_audio_streams(file_path: str, log_fn: LogFn = None) -> List[Dict]:
+    """Return list of audio stream metadata with positional order and language."""
+    meta: List[Dict] = []
+    try:
+        cmd = ['ffprobe','-v','error','-select_streams','a','-show_entries','stream=index:stream_tags=language','-of','json', file_path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        data = json.loads(res.stdout or '{}')
+        for pos, s in enumerate(data.get('streams', [])):
+            idx = s.get('index')
+            lang = (s.get('tags') or {}).get('language', 'und')
+            meta.append({'pos': pos, 'index': idx, 'lang': lang})
+    except Exception as e:
+        _safe_log(log_fn, f"get_audio_streams error: {e}")
+    return meta
+
+def quick_probe_field_order(file_path: str, log_fn: LogFn = None) -> Optional[str]:
+    """Return field_order for first video stream (lowercase) or None."""
+    try:
+        cmd = ['ffprobe','-v','error','-select_streams','v:0','-show_entries','stream=field_order','-of','default=noprint_wrappers=1:nokey=1', file_path]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        val = (res.stdout or '').strip().lower()
+        return val if val else None
+    except Exception as e:
+        _safe_log(log_fn, f"quick_probe_field_order error: {e}")
+    return None
+
+def detect_interlacing(file_path: str, log_fn: LogFn = None) -> str:
+    """Return 'interlaced', 'progressive', or 'unknown'. Uses field_order then idet heuristic."""
+    fo = quick_probe_field_order(file_path, log_fn)
+    if fo:
+        if fo in {'tt','bb','tb','bt','tff','bff','interlaced'}:
+            return 'interlaced'
+        if fo == 'progressive':
+            return 'progressive'
+    try:
+        cmd = ['ffmpeg','-hide_banner','-loglevel','info','-nostdin','-i', file_path,
+               '-filter:v','idet','-frames:v','300','-an','-f','null','-']
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        txt = (proc.stderr or '') + (proc.stdout or '')
+        m = re.search(r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)", txt)
+        if not m:
+            m = re.search(r"Single frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)", txt)
+        if m:
+            tff = int(m.group(1)); bff = int(m.group(2)); prog = int(m.group(3))
+            interlaced_hits = tff + bff
+            if interlaced_hits >= max(30, prog //2):
+                return 'interlaced'
+            if prog > interlaced_hits:
+                return 'progressive'
+    except Exception as e:
+        _safe_log(log_fn, f"idet detection error: {e}")
+    return 'unknown'

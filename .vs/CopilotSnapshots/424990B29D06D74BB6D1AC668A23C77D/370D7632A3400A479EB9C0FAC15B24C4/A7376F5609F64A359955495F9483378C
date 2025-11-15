@@ -1,0 +1,15 @@
+﻿import sys
+from PyQt6.QtWidgets import QApplication
+from gui.main_window_old import MainWindow
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    # Load QSS from external file
+    try:
+        with open("style.qss", "r") as f:
+            app.setStyleSheet(f.read())
+    except Exception as e:
+        print(f"Could not load stylesheet: {e}")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())

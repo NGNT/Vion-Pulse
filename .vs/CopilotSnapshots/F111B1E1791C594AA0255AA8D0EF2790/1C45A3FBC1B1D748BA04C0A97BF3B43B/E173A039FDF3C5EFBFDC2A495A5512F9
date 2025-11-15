@@ -1,0 +1,127 @@
+﻿from PyQt6.QtCore import QObject, pyqtSignal
+import os
+from typing import Optional
+from gui.probe import (
+ probe_attached_pictures,
+ get_video_duration,
+ get_subtitle_streams,
+ get_audio_streams,
+ quick_probe_field_order,
+ get_video_resolution_and_codec,
+)
+
+
+class InputProbeWorker(QObject):
+ """Worker that probes a media file off the UI thread and emits results as a dict.
+
+ Signals:
+ - probed(dict): emitted on success with collected metadata
+ - error(str): emitted on failure with error message
+ - log(str): emitted for log messages
+ - finished(): emitted when worker completes (success or error)
+ """
+ probed = pyqtSignal(object)
+ error = pyqtSignal(str)
+ log = pyqtSignal(str)
+ finished = pyqtSignal()
+
+ def __init__(self, parent: Optional[QObject] = None):
+ super().__init__(parent)
+ self._running = True
+
+ def stop(self):
+ self._running = False
+
+ def run(self, file_path: str):
+ try:
+ self._running = True
+ if not file_path or not os.path.exists(file_path):
+ self.error.emit(f"File does not exist: {file_path}")
+ self.finished.emit()
+ return
+
+ # Duration
+ try:
+ duration = get_video_duration(file_path, self._emit_log)
+ except Exception as e:
+ duration =0.0
+ self._emit_log(f"duration probe error: {e}")
+ if not self._running:
+ self.finished.emit(); return
+
+ # File size
+ try:
+ size_bytes = os.path.getsize(file_path)
+ except Exception as e:
+ size_bytes =0
+ self._emit_log(f"size probe error: {e}")
+ if not self._running:
+ self.finished.emit(); return
+
+ # Resolution & codec
+ try:
+ resolution, codec = get_video_resolution_and_codec(file_path, self._emit_log)
+ except Exception as e:
+ resolution, codec = 'N/A', 'N/A'
+ self._emit_log(f"resolution probe error: {e}")
+ if not self._running:
+ self.finished.emit(); return
+
+ # Attached pictures
+ try:
+ attached = probe_attached_pictures(file_path, self._emit_log)
+ except Exception as e:
+ attached = []
+ self._emit_log(f"attached pictures probe error: {e}")
+ if not self._running:
+ self.finished.emit(); return
+
+ # Subtitle streams
+ try:
+ subtitle_display, subtitle_meta = get_subtitle_streams(file_path, self._emit_log)
+ except Exception as e:
+ subtitle_display, subtitle_meta = [], []
+ self._emit_log(f"subtitle probe error: {e}")
+ if not self._running:
+ self.finished.emit(); return
+
+ # Audio streams
+ try:
+ audio_meta = get_audio_streams(file_path, self._emit_log)
+ except Exception as e:
+ audio_meta = []
+ self._emit_log(f"audio probe error: {e}")
+ if not self._running:
+ self.finished.emit(); return
+
+ # Quick field_order hint
+ try:
+ field_order = quick_probe_field_order(file_path, self._emit_log)
+ except Exception as e:
+ field_order = None
+ self._emit_log(f"field_order probe error: {e}")
+
+ result = {
+ 'file_path': file_path,
+ 'duration': duration,
+ 'size_bytes': size_bytes,
+ 'resolution': resolution,
+ 'codec': codec,
+ 'attached_pics': attached,
+ 'subtitle_display': subtitle_display,
+ 'subtitle_meta': subtitle_meta,
+ 'audio_meta': audio_meta,
+ 'field_order': field_order,
+ }
+
+ self.probed.emit(result)
+ except Exception as e:
+ self.error.emit(str(e))
+ finally:
+ self.finished.emit()
+
+ def _emit_log(self, msg: str):
+ try:
+ self.log.emit(msg)
+ except Exception:
+ pass

@@ -1,0 +1,85 @@
+﻿import subprocess
+import os
+import tempfile
+import shutil
+import json
+
+def get_attached_pic_indices(input_file):
+    """Return a list of video stream indices flagged as attached_pic."""
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'stream=index,codec_type,disposition,codec_name',
+        '-of', 'json', input_file
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    data = json.loads(res.stdout or '{}')
+    indices = []
+    for s in data.get('streams', []):
+        if s.get('codec_type') == 'video':
+            disp = s.get('disposition') or {}
+            if int(disp.get('attached_pic') or 0) == 1:
+                indices.append(int(s.get('index')))
+    return indices
+
+def extract_cover_art(input_file, output_dir=None):
+    """Extract cover art stream(s) from input_file. Returns list of image file paths."""
+    indices = get_attached_pic_indices(input_file)
+    if not indices:
+        return []
+    if output_dir is None:
+        output_dir = tempfile.mkdtemp()
+    out_files = []
+    for idx in indices:
+        out_path = os.path.join(output_dir, f'cover_{idx}.jpg')
+        cmd = [
+            'ffmpeg', '-y', '-i', input_file,
+            '-map', f'0:v:{idx}', '-c:v', 'copy', out_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if os.path.exists(out_path):
+            out_files.append(out_path)
+    return out_files
+
+def apply_cover_art_to_output(input_file, output_file, temp_output=None):
+    """Apply cover art from input_file to output_file. Optionally writes to temp_output and replaces output_file."""
+    indices = get_attached_pic_indices(input_file)
+    if not indices:
+        return False
+
+    # Only handle MP4 for now (can add MKV logic if needed)
+    ext = os.path.splitext(output_file)[1].lower()
+    if ext != ".mp4":
+        # Existing logic for MKV, etc. (if needed)
+        return False
+
+    # Extract cover art as JPEG
+    cover_jpeg = os.path.join(tempfile.gettempdir(), "cover_art.jpg")
+    cmd_extract = [
+        "ffmpeg", "-y", "-i", input_file,
+        "-map", f"0:v:{indices[0]}", "-c:v", "mjpeg", cover_jpeg
+    ]
+    subprocess.run(cmd_extract, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if not os.path.exists(cover_jpeg):
+        return False
+
+    # Remux output file and cover art JPEG
+    if temp_output is None:
+        temp_output = output_file + ".withcover.tmp"
+    cmd_remux = [
+        "ffmpeg", "-y",
+        "-i", output_file,
+        "-i", cover_jpeg,
+        "-map", "0", "-map", "1",
+        "-c", "copy", "-c:v:1", "mjpeg",
+        "-disposition:v:1", "attached_pic",
+        temp_output
+    ]
+    subprocess.run(cmd_remux, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if os.path.exists(temp_output):
+        os.replace(temp_output, output_file)
+        os.remove(cover_jpeg)
+        return True
+
+    if os.path.exists(cover_jpeg):
+        os.remove(cover_jpeg)
+    return False

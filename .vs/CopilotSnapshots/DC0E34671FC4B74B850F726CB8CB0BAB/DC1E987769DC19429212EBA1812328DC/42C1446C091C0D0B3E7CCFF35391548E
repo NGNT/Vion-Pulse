@@ -1,0 +1,7 @@
+﻿import sys
+import tkinter as tk
+from main_window import VideoConverter
+
+if __name__ == "__main__":
+    app = VideoConverter()
+    app.run()

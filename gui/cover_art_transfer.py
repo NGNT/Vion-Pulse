@@ -1,0 +1,239 @@
+import subprocess
+import os
+import tempfile
+import json
+import shlex
+
+
+def _dbg(msg: str):
+    try:
+        print(f"[cover_art_transfer] {msg}", flush=True)
+    except Exception:
+        pass
+
+
+def _fmt_cmd(cmd):
+    try:
+        return " ".join(shlex.quote(str(x)) for x in cmd)
+    except Exception:
+        return str(cmd)
+
+
+def get_media_duration(path: str) -> float:
+    """Return duration in seconds (float) or0.0 on failure."""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode ==0:
+            return float(res.stdout.strip())
+    except Exception as e:
+        _dbg(f"get_media_duration error: {e}")
+    return 0.0
+
+
+def get_attached_pic_indices(input_file):
+    """Return absolute stream indices of embedded cover art video streams.
+    Uses ffprobe to find video streams with disposition attached_pic OR mjpeg stills.
+    """
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-show_entries', 'stream=index,codec_type,disposition,codec_name,nb_frames,duration',
+        '-of', 'json', input_file
+    ]
+    _dbg(f"Probing streams for cover art: {_fmt_cmd(cmd)}")
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode !=0:
+        _dbg(f"ffprobe returned {res.returncode}; stderr: {res.stderr}")
+    raw = res.stdout or '{}'
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        _dbg(f"Failed to parse ffprobe JSON: {e}")
+        data = {'streams': []}
+    indices = []
+    streams = data.get('streams', [])
+    _dbg(f"Total streams found: {len(streams)}")
+    for s in streams:
+        try:
+            if s.get('codec_type') != 'video':
+                continue
+            disp = s.get('disposition') or {}
+            attached = int(disp.get('attached_pic') or 0) ==1
+            codec = (s.get('codec_name') or '').lower()
+            nb_frames = int(s.get('nb_frames') or 0)
+            dur_raw = s.get('duration')
+            try:
+                dur = float(dur_raw) if dur_raw is not None else 0.0
+            except (ValueError, TypeError):
+                dur =0.0
+            idx = int(s.get('index'))
+            _dbg(f"Video stream index={idx}, codec={codec}, attached_pic={attached}, nb_frames={nb_frames}, dur={dur}")
+            if attached or (codec == 'mjpeg' and (nb_frames <=1 or dur <=1.0)):
+                indices.append(idx)
+        except Exception as e:
+            _dbg(f"Error processing stream entry: {e}")
+    _dbg(f"Detected cover art indices: {indices}")
+    return indices
+
+
+def _remux_with_cover(output_file: str, cover_source_path: str) -> bool:
+    """Remux output_file and external cover_source_path JPEG into final MP4."""
+    temp_output = output_file + '.cover_apply_tmp.mp4'
+    remux_cmd = [
+        'ffmpeg', '-y',
+        '-i', output_file,
+        '-i', cover_source_path,
+        '-map', '0', '-map', '1',
+        '-c', 'copy',
+        '-c:v:1', 'mjpeg',
+        '-disposition:v:1', 'attached_pic',
+        '-metadata:s:v:1', 'handler_name=Cover Art',
+        '-movflags', '+faststart',
+        '-f', 'mp4',
+        temp_output
+    ]
+    _dbg(f"Remux (generic) command: {_fmt_cmd(remux_cmd)}")
+    proc = subprocess.run(remux_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _dbg(f"Remux (generic) returncode={proc.returncode}")
+    if proc.stderr:
+        _dbg(f"Remux (generic) stderr:\n{proc.stderr}")
+    if os.path.exists(temp_output) and os.path.getsize(temp_output) >0:
+        try:
+            os.replace(temp_output, output_file)
+            _dbg("Remux success; cover applied.")
+            return True
+        except Exception as e:
+            _dbg(f"Failed to replace output after remux: {e}")
+    return False
+
+
+def _extract_attached_pic(input_file: str, pic_index: int) -> str:
+    """Extract attached_pic stream to a JPEG file and return path or '' if failed."""
+    cover_path = os.path.join(tempfile.gettempdir(), f'cover_extract_{os.getpid()}.jpg')
+    extract_cmd = [
+        'ffmpeg', '-y', '-i', input_file,
+        '-map', f'0:{pic_index}', '-frames:v', '1', '-q:v', '2', cover_path
+    ]
+    _dbg(f"Extract attached_pic JPEG command: {_fmt_cmd(extract_cmd)}")
+    proc = subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _dbg(f"Extract attached_pic returncode={proc.returncode}")
+    if proc.stderr:
+        _dbg(f"Extract attached_pic stderr:\n{proc.stderr}")
+    if os.path.exists(cover_path) and os.path.getsize(cover_path) >0:
+        _dbg(f"Extracted cover JPEG size={os.path.getsize(cover_path)} path={cover_path}")
+        return cover_path
+    _dbg("Attached_pic extraction failed.")
+    return ''
+
+
+def _grab_frame_still(input_file: str) -> str:
+    """Grab a fallback still frame:5s if duration >=5s else2s (or <= duration)."""
+    duration = get_media_duration(input_file)
+    if duration <=0:
+        _dbg("Could not determine duration; using2s fallback time.")
+        capture_time =2
+    else:
+        capture_time =5 if duration >=5 else min(2, duration)
+    cover_path = os.path.join(tempfile.gettempdir(), f'cover_fallback_{os.getpid()}.jpg')
+    grab_cmd = [
+        'ffmpeg', '-y', '-ss', str(capture_time), '-i', input_file,
+        '-frames:v', '1', '-q:v', '3', cover_path
+    ]
+    _dbg(f"Fallback frame grab command: {_fmt_cmd(grab_cmd)} (capture_time={capture_time}, duration={duration})")
+    proc = subprocess.run(grab_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    _dbg(f"Fallback frame grab returncode={proc.returncode}")
+    if proc.stderr:
+        _dbg(f"Fallback frame grab stderr:\n{proc.stderr}")
+    if os.path.exists(cover_path) and os.path.getsize(cover_path) >0:
+        _dbg(f"Fallback still created size={os.path.getsize(cover_path)} path={cover_path}")
+        return cover_path
+    _dbg("Fallback still frame creation failed.")
+    return ''
+
+
+def apply_cover_art_to_output(input_file, output_file):
+    """Apply cover art to MP4 output.
+    Order:
+1. Try direct mapping of attached_pic stream.
+2. If that fails, extract attached_pic and remux.
+3. If no attached_pic or both fail, grab fallback still frame (5s/2s rule) and remux.
+ Returns True if some form of cover art applied.
+ """
+    _dbg(f"apply_cover_art_to_output called with input={input_file}, output={output_file}")
+    if not output_file or not os.path.exists(output_file):
+        _dbg("Output file does not exist; aborting cover art apply.")
+        return False
+    if not output_file.lower().endswith('.mp4'):
+        _dbg("Output is not an MP4; skipping cover art apply.")
+        return False
+
+    pic_indices = get_attached_pic_indices(input_file)
+    pic_index = pic_indices[0] if pic_indices else None
+
+    #1. Direct mapping attempt
+    if pic_index is not None:
+        _dbg(f"Attempting direct remux with attached_pic index {pic_index}")
+        temp_output_direct = output_file + '.cover_direct_tmp.mp4'
+        direct_cmd = [
+            'ffmpeg', '-y',
+            '-i', output_file,
+            '-i', input_file,
+            '-map', '0',
+            '-map', f'1:{pic_index}',
+            '-c', 'copy',
+            '-c:v:1', 'mjpeg',
+            '-disposition:v:1', 'attached_pic',
+            '-metadata:s:v:1', 'handler_name=Cover Art',
+            '-movflags', '+faststart',
+            '-f', 'mp4',
+            temp_output_direct
+        ]
+        _dbg(f"Direct remux command: {_fmt_cmd(direct_cmd)}")
+        proc_direct = subprocess.run(direct_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        _dbg(f"Direct remux returncode={proc_direct.returncode}")
+        if proc_direct.stderr:
+            _dbg(f"Direct remux stderr:\n{proc_direct.stderr}")
+        if os.path.exists(temp_output_direct) and os.path.getsize(temp_output_direct) >0:
+            try:
+                os.replace(temp_output_direct, output_file)
+                _dbg("Direct attached_pic remux succeeded.")
+                return True
+            except Exception as e:
+                _dbg(f"Replacing output after direct remux failed: {e}")
+        else:
+            _dbg("Direct remux did not produce valid output.")
+
+    #2. Extract attached_pic and remux
+    cover_path = _extract_attached_pic(input_file, pic_index)
+    if cover_path:
+        if _remux_with_cover(output_file, cover_path):
+            _dbg("Remux with extracted attached_pic succeeded.")
+            try: os.remove(cover_path)
+            except OSError: pass
+            return True
+        else:
+            _dbg("Remux with extracted attached_pic failed.")
+            try: os.remove(cover_path)
+            except OSError: pass
+    else:
+        _dbg("No attached_pic extracted; proceeding to fallback.")
+
+    #3. Fallback still from video
+    fallback_cover = _grab_frame_still(input_file)
+    if fallback_cover:
+        if _remux_with_cover(output_file, fallback_cover):
+            _dbg("Fallback still frame remux succeeded.")
+            try: os.remove(fallback_cover)
+            except OSError: pass
+            return True
+        else:
+            _dbg("Fallback still frame remux failed.")
+            try: os.remove(fallback_cover)
+            except OSError: pass
+
+    _dbg("All cover art application attempts failed.")
+    return False
+

@@ -1,0 +1,180 @@
+﻿from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QPushButton,
+ QFileDialog, QLabel, QTabWidget, QComboBox, QSpinBox,
+ QCheckBox, QGroupBox, QProgressBar, QMessageBox, QLineEdit, QPlainTextEdit)
+from PyQt6.QtCore import Qt, QThread
+from PyQt6.QtGui import QAction
+import os
+import subprocess
+import json # added for probing helper that parses ffprobe json
+from gui.conversion_thread import ConversionThread
+from gui.input_probe_worker import InputProbeWorker
+from gui.probe import (
+ probe_attached_pictures as probe_cover,
+ get_video_duration as probe_duration,
+ get_subtitle_streams as probe_subs,
+ get_audio_streams as probe_audio,
+ quick_probe_field_order as probe_field_order,
+ detect_interlacing as probe_detect_interlace,
+ get_video_resolution_and_codec as probe_resolution_codec,
+)
+from gui.hw import get_available_hw_accels as hw_get_available_hw_accels, get_ffmpeg_hw_accel_args as hw_get_ffmpeg_hw_accel_args
+from gui.path_utils import _escape_path_for_subtitles_filter
+from gui.bitrate import estimate_video_bitrate_from_size as estimate_bitrate_from_size
+from gui.container_rules import handle_format_changed, adjust_and_warn_container_codec
+from gui.command_builder import build_ffmpeg_command
+
+class MainWindow(QMainWindow):
+ def __init__(self):
+ super().__init__()
+ self.setWindowTitle("Video Transcoder")
+ self.setMinimumSize(800,600)
+ # Initialize variables
+ self.input_file = ""
+ self.output_file = ""
+ self._last_warnings = [] # store auto-adjust warnings
+ self._input_attached_pics = []
+ self._subtitle_meta = []
+ self._audio_meta = []
+ self._probe_thread = None
+ self._probe_worker = None
+ self.setup_ui()
+ self.setup_menu()
+
+ def log(self, msg: str):
+ try:
+ if hasattr(self, 'log_view') and self.log_view is not None:
+ self.log_view.appendPlainText(msg)
+ print(msg, flush=True)
+ except Exception:
+ pass
+
+ # --- Probing wrappers using worker module ---
+ def probe_attached_pictures(self, file_path: str):
+ return probe_cover(file_path, self.log)
+
+ def get_video_duration(self, file_path: str) -> float:
+ return probe_duration(file_path, self.log)
+
+ def get_subtitle_streams(self, file_path: str):
+ display, meta = probe_subs(file_path, self.log)
+ self._subtitle_meta = meta
+ return display
+
+ def get_audio_streams(self, file_path: str):
+ meta = probe_audio(file_path, self.log)
+ self._audio_meta = meta
+ return meta
+
+ def quick_probe_field_order(self, file_path: str):
+ return probe_field_order(file_path, self.log)
+
+ def detect_interlacing(self, file_path: str) -> str:
+ return probe_detect_interlace(file_path, self.log)
+
+ def escape_path_for_subtitles_filter(self, path: str) -> str:
+ return _escape_path_for_subtitles_filter(path)
+
+ def estimate_video_bitrate_from_size(self, input_file, get_duration_fn, target_size_mb, audio_bitrate_text, log_fn):
+ return estimate_bitrate_from_size(input_file, get_duration_fn, target_size_mb, audio_bitrate_text, log_fn)
+
+ # Existing methods below, updated to use probe helpers
+ def setup_ui(self):
+ """Set up the main UI components"""
+ # Main widget and layout
+ main_widget = QWidget()
+ self.setCentralWidget(main_widget)
+ layout = QVBoxLayout(main_widget)
+ 
+ # Header title
+ title_label = QLabel("Video Transcoder")
+ title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+ title_label.setStyleSheet("font-size:18px; font-weight: bold; margin:10px;")
+ layout.addWidget(title_label)
+ 
+ # Input/Output section
+ io_group = QGroupBox("Input / Output")
+ io_layout = QVBoxLayout()
+ 
+ # Input file selection
+ input_layout = QHBoxLayout()
+ self.input_label = QLabel("No file selected")
+ input_btn = QPushButton("Select Input File")
+ input_btn.clicked.connect(self.select_input_file)
+ input_layout.addWidget(QLabel("Input File:"))
+ input_layout.addWidget(self.input_label,1)
+ input_layout.addWidget(input_btn)
+ 
+ # Output file selection
+ output_layout = QHBoxLayout()
+ self.output_label = QLabel("No output file selected")
+ output_btn = QPushButton("Select Output File")
+ output_btn.clicked.connect(self.select_output_file)
+ output_layout.addWidget(QLabel("Output File:"))
+ output_layout.addWidget(self.output_label,1)
+ output_layout.addWidget(output_btn)
+ 
+ # Input file info
+ info_layout = QVBoxLayout()
+ self.duration_label = QLabel("Duration: N/A")
+ self.size_label = QLabel("File Size: N/A")
+ self.bitrate_label = QLabel("Bitrate: N/A")
+ self.resolution_label = QLabel("Resolution: N/A")
+ self.codec_label = QLabel("Video Codec: N/A")
+ info_layout.addWidget(self.duration_label)
+ info_layout.addWidget(self.size_label)
+ info_layout.addWidget(self.bitrate_label)
+ info_layout.addWidget(self.resolution_label)
+ info_layout.addWidget(self.codec_label)
+ 
+ io_layout.addLayout(input_layout)
+ io_layout.addLayout(output_layout)
+ io_layout.addLayout(info_layout)
+ io_group.setLayout(io_layout)
+ 
+ # Format selection
+ format_group = QGroupBox("Output Format")
+ format_layout = QHBoxLayout()
+ self.format_combo = QComboBox()
+ self.format_combo.addItems(["MP4", "MKV", "AVI", "MOV", "WebM"])
+ format_layout.addWidget(QLabel("Format:"))
+ format_layout.addWidget(self.format_combo,1)
+ format_group.setLayout(format_layout)
+ 
+ # Tabs
+ self.tabs = QTabWidget()
+ self.setup_video_tab()
+ self.setup_audio_tab()
+ self.setup_advanced_tab()
+ self.setup_subtitles_tab()
+ 
+ # Progress bar
+ self.progress_bar = QProgressBar(); self.progress_bar.setValue(0)
+ 
+ # Control buttons
+ control_layout = QHBoxLayout()
+ self.start_btn = QPushButton("Start")
+ self.start_btn.clicked.connect(self.start_conversion)
+ self.cancel_btn = QPushButton("Cancel"); self.cancel_btn.setEnabled(False)
+ self.cancel_btn.clicked.connect(self.cancel_conversion)
+ control_layout.addStretch(); control_layout.addWidget(self.cancel_btn); control_layout.addWidget(self.start_btn)
+ 
+ # Add all to main layout
+ layout.addWidget(io_group)
+ layout.addWidget(format_group)
+ layout.addWidget(self.tabs,1)
+ layout.addWidget(self.progress_bar)
+ 
+ # Log panel
+ log_group = QGroupBox("Log Output")
+ log_layout = QVBoxLayout()
+ self.log_view = QPlainTextEdit()
+ self.log_view.setReadOnly(True)
+ self.log_view.setMaximumBlockCount(5000) # prevent unlimited growth
+ log_layout.addWidget(self.log_view)
+ log_group.setLayout(log_layout)
+ layout.addWidget(log_group,2)
+
+ layout.addLayout(control_layout)
+ 
+ # Connect format change for sensible defaults
+ self.format_combo.currentTextChanged.connect(self.handle_format_changed)

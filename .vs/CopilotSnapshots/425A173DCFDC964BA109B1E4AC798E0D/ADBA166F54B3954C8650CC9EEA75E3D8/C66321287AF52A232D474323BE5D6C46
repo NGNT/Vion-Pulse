@@ -1,0 +1,395 @@
+﻿"""
+Resolution and Scaling Worker - Handles video resolution scaling and anamorphic correction
+
+This worker provides resolution limiting, scaling, and anamorphic correction functionality
+to adjust video dimensions and aspect ratios for output.
+"""
+
+import os
+import subprocess
+import json
+import re
+from typing import Dict, Optional, Tuple, Any
+from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtWidgets import QComboBox, QSpinBox, QLabel, QHBoxLayout, QVBoxLayout, QGroupBox, QCheckBox, QWidget
+
+
+class ScalingWorker(QObject):
+    """Worker class for detecting and applying video scaling in a separate thread."""
+
+    # Signals
+    scaling_detected = pyqtSignal(dict)  # Emits detected scaling values
+    progress_updated = pyqtSignal(int)  # Progress percentage (0-100)
+    error_occurred = pyqtSignal(str)  # Error message
+    log_message = pyqtSignal(str)  # Log messages
+    finished = pyqtSignal()  # Worker completed
+
+    def __init__(self, video_path: str):
+        """
+        Initialize the scaling worker.
+
+        Args:
+            video_path: Path to the video file to analyze
+        """
+        super().__init__()
+        self.video_path = video_path
+        self._should_stop = False
+
+    def stop(self):
+        """Stop the scaling detection process."""
+        self._should_stop = True
+
+    def detect_scaling(self, resolution_limit: str, anamorphic_mode: str) -> Optional[Dict[str, any]]:
+        """
+        Detect optimal scaling values based on settings.
+
+        Returns:
+            Dictionary with scaling values or None
+        """
+        try:
+            self.log_message.emit(f"Starting scaling detection for: {os.path.basename(self.video_path)}")
+
+            # Get video resolution first
+            resolution = self._get_video_resolution()
+            if not resolution:
+                self.error_occurred.emit("Could not determine video resolution")
+                return None
+
+            width, height = resolution
+            self.log_message.emit(f"Video resolution: {width}x{height}")
+
+            # For now, simple scaling based on limit
+            scaling = self._calculate_scaling(width, height, resolution_limit, anamorphic_mode)
+
+            if scaling:
+                self.log_message.emit(f"Calculated scaling: {scaling}")
+                self.scaling_detected.emit(scaling)
+                return scaling
+            else:
+                self.error_occurred.emit("Could not determine scaling values")
+                return None
+
+        except Exception as e:
+            self.error_occurred.emit(f"Error during scaling detection: {str(e)}")
+            return None
+        finally:
+            self.finished.emit()
+
+    def _get_video_resolution(self) -> Optional[Tuple[int, int]]:
+        """Get the video resolution using ffprobe."""
+        try:
+            cmd = [
+                'ffprobe', '-v', 'quiet',
+                '-show_entries', 'stream=codec_type,width,height,disposition',
+                '-of', 'json',
+                self.video_path
+            ]
+
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            )
+
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                for stream in data.get('streams', []):
+                    if stream.get('codec_type') == 'video':
+                        disp = stream.get('disposition', {})
+                        attached = disp.get('attached_pic', False)
+                        if not attached:
+                            width = stream.get('width')
+                            height = stream.get('height')
+                            if width and height:
+                                return (width, height)
+
+            return None
+
+        except Exception as e:
+            self.log_message.emit(f"Error getting video resolution: {str(e)}")
+            return None
+
+    def _calculate_scaling(self, width: int, height: int, resolution_limit: str, anamorphic_mode: str) -> Optional[Dict[str, any]]:
+        """Calculate scaling parameters."""
+        # Simple implementation
+        limit_map = {
+            'Original': None,
+            '4K (2160p)': 2160,
+            '1440p': 1440,
+            '1080p': 1080,
+            '720p': 720,
+            '480p': 480
+        }
+
+        target_height = limit_map.get(resolution_limit)
+        if target_height and height > target_height:
+            new_width = int(width * target_height / height)
+            new_height = target_height
+            return {
+                'width': new_width,
+                'height': new_height,
+                'original_width': width,
+                'original_height': height
+            }
+        else:
+            return {
+                'width': width,
+                'height': height,
+                'original_width': width,
+                'original_height': height
+            }
+
+
+class ScalingWidget(QGroupBox):
+    """Widget for scaling controls."""
+
+    settings_changed = pyqtSignal()
+
+    def __init__(self):
+        super().__init__("Resolution & Scaling")
+        self.setup_ui()
+
+    def setup_ui(self):
+        """Set up the scaling controls UI."""
+        layout = QVBoxLayout()
+
+        # Resolution Limit
+        limit_layout = QHBoxLayout()
+        limit_layout.addWidget(QLabel("Resolution Limit:"))
+        self.resolution_limit = QComboBox()
+        self.resolution_limit.addItems(["Original", "Custom", "4K (2160p)", "1440p", "1080p", "720p", "480p"])
+        self.resolution_limit.currentTextChanged.connect(self._on_resolution_limit_changed)
+        # Emit settings changed when relevant controls change
+        self.resolution_limit.currentTextChanged.connect(self._on_settings_changed)
+        limit_layout.addWidget(self.resolution_limit)
+        layout.addLayout(limit_layout)
+
+        # Scaled Size (for custom)
+        self.size_widget = QWidget()
+        self.size_layout = QHBoxLayout(self.size_widget)
+        self.size_layout.addWidget(QLabel("Scaled Width:"))
+        self.scaled_width = QSpinBox()
+        self.scaled_width.setRange(1, 10000)
+        self.scaled_width.setValue(1920)
+        self.size_layout.addWidget(self.scaled_width)
+        self.size_layout.addWidget(QLabel("Height:"))
+        self.scaled_height = QSpinBox()
+        self.scaled_height.setRange(1, 10000)
+        self.scaled_height.setValue(1080)
+        self.size_layout.addWidget(self.scaled_height)
+        layout.addWidget(self.size_widget)
+
+        # Anamorphic
+        anamorphic_layout = QHBoxLayout()
+        anamorphic_layout.addWidget(QLabel("Anamorphic:"))
+        self.anamorphic = QComboBox()
+        self.anamorphic.addItems(["None", "Automatic", "Custom"])
+        anamorphic_layout.addWidget(self.anamorphic)
+        self.anamorphic.currentTextChanged.connect(self._on_settings_changed)
+        layout.addLayout(anamorphic_layout)
+
+        # Pixel Aspect (for custom)
+        self.pixel_layout = QHBoxLayout()
+        self.pixel_layout.addWidget(QLabel("Pixel Aspect:"))
+        self.pixel_aspect = QSpinBox()
+        self.pixel_aspect.setRange(1, 100)
+        self.pixel_aspect.setValue(1)
+        self.pixel_layout.addWidget(self.pixel_aspect)
+        self.pixel_aspect.valueChanged.connect(self._on_settings_changed)
+        layout.addLayout(self.pixel_layout)
+
+        # Allow Upscaling
+        self.allow_upscaling = QCheckBox("Allow Upscaling")
+        layout.addWidget(self.allow_upscaling)
+        self.allow_upscaling.toggled.connect(self._on_settings_changed)
+
+        # Status label
+        self.status_label = QLabel("Select a video file to configure scaling")
+        self.status_label.setStyleSheet("font-style: italic; color: #666;")
+        layout.addWidget(self.status_label)
+
+        self.setLayout(layout)
+
+        # Initial visibility
+        self._on_resolution_limit_changed("Original")
+
+    def _on_resolution_limit_changed(self, mode: str):
+        """Handle resolution limit changes."""
+        is_custom = mode == "Custom"
+        self.size_widget.setVisible(is_custom)
+        if not is_custom:
+            # Reset to defaults when not custom
+            self.scaled_width.setValue(1920)
+            self.scaled_height.setValue(1080)
+
+    def get_scaling_settings(self) -> Dict:
+        """Get current scaling settings."""
+        return {
+            'resolution_limit': self.resolution_limit.currentText(),
+            'anamorphic': self.anamorphic.currentText(),
+            'pixel_aspect': self.pixel_aspect.value(),
+            'scaled_width': self.scaled_width.value(),
+            'scaled_height': self.scaled_height.value(),
+            'allow_upscaling': self.allow_upscaling.isChecked()
+        }
+
+    def set_scaling_settings(self, settings: dict):
+        """Set scaling settings from a dict."""
+        self.resolution_limit.setCurrentText(settings.get('resolution_limit', self.resolution_limit.currentText()))
+        self.anamorphic.setCurrentText(settings.get('anamorphic', self.anamorphic.currentText()))
+        self.pixel_aspect.setValue(settings.get('pixel_aspect', self.pixel_aspect.value()))
+        self.scaled_width.setValue(settings.get('scaled_width', self.scaled_width.value()))
+        self.scaled_height.setValue(settings.get('scaled_height', self.scaled_height.value()))
+        self.allow_upscaling.setChecked(settings.get('allow_upscaling', self.allow_upscaling.isChecked()))
+
+    def update_video_resolution(self, width: int, height: int):
+        """Update spin box ranges based on video resolution."""
+        self.scaled_width.setMaximum(width * 2)  # Allow up to 2x
+        self.scaled_height.setMaximum(height * 2)
+        if self.resolution_limit.currentText() != "Custom":
+            self.scaled_width.setValue(width)
+            self.scaled_height.setValue(height)
+        self.status_label.setText(f"Video resolution: {width}x{height}. Configure scaling settings.")
+
+    def _on_settings_changed(self, *_args):
+        """Emit settings_changed when any control changes."""
+        self.settings_changed.emit()
+
+
+class ScalingManager(QObject):
+    """Manager class for handling scaling operations."""
+
+    scaling_detected = pyqtSignal(dict)  # Signal for detected scaling values
+
+    def __init__(self, log_callback=None):
+        """
+        Initialize the scaling manager.
+
+        Args:
+            log_callback: Optional callback function for log messages
+        """
+        super().__init__()
+        self.log_callback = log_callback
+        self._worker = None
+        self._thread = None
+        self.current_scaling = None
+
+    def detect_scaling(self, video_path: str, resolution_limit: str, anamorphic_mode: str) -> Optional[Dict[str, any]]:
+        """
+        Start scaling detection for a video file.
+
+        Args:
+            video_path: Path to video file
+            resolution_limit: Resolution limit setting
+            anamorphic_mode: Anamorphic mode
+
+        Returns:
+            Dictionary with scaling values or None
+        """
+        # Stop any existing detection
+        self.stop_detection()
+
+        # Start new detection
+        self._thread = QThread()
+        self._worker = ScalingWorker(video_path)
+        self._worker.moveToThread(self._thread)
+
+        # Connect signals
+        self._worker.scaling_detected.connect(self._on_scaling_detected)
+        self._worker.error_occurred.connect(self._on_error)
+        self._worker.log_message.connect(self._on_log)
+        self._worker.finished.connect(self._cleanup_worker)
+
+        # Start the worker
+        self._thread.started.connect(lambda: self._worker.detect_scaling(resolution_limit, anamorphic_mode))
+        self._thread.start()
+
+        return None  # Result will come via signal
+
+    def stop_detection(self):
+        """Stop current scaling detection."""
+        if self._worker:
+            self._worker.stop()
+
+        if self._thread and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(3000)
+
+    def get_scaling_filter(self, scaling_settings: Dict) -> Optional[str]:
+        """
+        Get FFmpeg scale filter string for the given scaling settings.
+
+        Args:
+            scaling_settings: Scaling settings dictionary
+
+        Returns:
+            FFmpeg filter string or None
+        """
+        resolution_limit = scaling_settings.get('resolution_limit', 'Original')
+        anamorphic = scaling_settings.get('anamorphic', 'None')
+        allow_upscaling = scaling_settings.get('allow_upscaling', False)
+        scaled_width = scaling_settings.get('scaled_width', 1920)
+        scaled_height = scaling_settings.get('scaled_height', 1080)
+
+        filters = []
+
+        # Resolution limiting
+        limit_map = {
+            '4K (2160p)': 2160,
+            '1440p': 1440,
+            '1080p': 1080,
+            '720p': 720,
+            '480p': 480
+        }
+
+        if resolution_limit == 'Custom':
+            filters.append(f'scale={scaled_width}:{scaled_height}')
+        elif resolution_limit in limit_map:
+            target_h = limit_map[resolution_limit]
+            if allow_upscaling:
+                filters.append(f'scale=-2:{target_h}')
+            else:
+                filters.append(f'scale=-2:min({target_h}\\,ih)')
+
+        # Anamorphic correction
+        if anamorphic == 'Automatic':
+            # Simple DAR correction, assuming 16:9
+            filters.append('setsar=1:1')
+        elif anamorphic == 'Custom':
+            pixel_aspect = scaling_settings.get('pixel_aspect', 1)
+            filters.append(f'setsar={pixel_aspect}:1')
+
+        if filters:
+            return ','.join(filters)
+        return None
+
+    def _on_scaling_detected(self, scaling_data: Dict[str, any]):
+        """Handle detected scaling values."""
+        self.current_scaling = scaling_data
+        self.scaling_detected.emit(scaling_data)  # Emit signal
+        if self.log_callback:
+            self.log_callback(f"Scaling detected: {scaling_data}")
+
+    def _on_error(self, error_msg: str):
+        """Handle detection error."""
+        if self.log_callback:
+            self.log_callback(f"Scaling detection error: {error_msg}")
+
+    def _on_log(self, message: str):
+        """Handle log messages."""
+        if self.log_callback:
+            self.log_callback(message)
+
+    def _cleanup_worker(self):
+        """Clean up worker and thread."""
+        try:
+            if self._thread:
+                self._thread.quit()
+                self._thread.wait(1000)
+        except Exception:
+            pass
+        finally:
+            self._worker = None
+            self._thread = None

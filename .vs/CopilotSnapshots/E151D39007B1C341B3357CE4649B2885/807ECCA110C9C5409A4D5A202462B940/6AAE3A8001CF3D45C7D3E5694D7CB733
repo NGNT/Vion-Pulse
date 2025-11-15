@@ -1,0 +1,47 @@
+﻿import QtQuick2.15
+import QtGraphicalEffects1.15
+
+// TintedLogo: recolors a source PNG using two-color gradient and a mask
+// Exposed properties:
+// - sourcePath: url of the source image
+// - color1, color2: theme-driven colors
+
+Item {
+ id: root
+ width:360
+ height:90
+
+ property url sourcePath: ""
+ property color color1: "#52FFF5"
+ property color color2: "#E6B35C"
+
+ // Load original logo
+ Image {
+ id: base
+ anchors.fill: parent
+ fillMode: Image.PreserveAspectFit
+ source: root.sourcePath
+ visible: false
+ smooth: true
+ mipmap: true
+ }
+
+ // Create a gradient colored layer
+ Rectangle {
+ id: gradientLayer
+ anchors.fill: parent
+ radius:0
+ visible: true
+ gradient: Gradient {
+ GradientStop { position:0.0; color: root.color1 }
+ GradientStop { position:1.0; color: root.color2 }
+ }
+ }
+
+ // Use the original alpha as a mask to punch the gradient into shape
+ OpacityMask {
+ anchors.fill: parent
+ source: gradientLayer
+ maskSource: base
+ }
+}
