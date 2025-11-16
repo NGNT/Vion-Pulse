@@ -294,7 +294,10 @@ class MainWindow(QMainWindow):
         format_group = QGroupBox("Output Format")
         format_layout = QHBoxLayout()
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["MP4", "MKV", "AVI", "MOV", "WebM", "FLV", "WMV", "TS", "M4V", "MPG", "VOB"])
+        self.format_combo.addItems([
+ "MP4", "MKV", "AVI", "MOV", "WebM", "FLV", "WMV", "TS", "M4V", "MPG", "VOB",
+ "Audio Only (MP3)", "Audio Only (AAC)"
+ ])
         format_layout.addWidget(QLabel("Format:"))
         format_layout.addWidget(self.format_combo,1)
         format_group.setLayout(format_layout)
@@ -397,6 +400,15 @@ class MainWindow(QMainWindow):
             lambda text: self.audio_settings_widget.audio_codec.setCurrentText(text),
             self._last_warnings
         )
+        # --- Disable/Enable tabs for audio-only formats ---
+        audio_only = self.format_combo.currentText().startswith("Audio Only")
+        # Tab order: Video, Audio, Advanced, Subtitles
+        self.settings_tabs.setTabEnabled(0, not audio_only) # Video
+        self.settings_tabs.setTabEnabled(2, not audio_only) # Advanced
+        self.settings_tabs.setTabEnabled(3, not audio_only) # Subtitles
+        # Tool tabs: Cropping, Scaling, Audio Analysis
+        self.tools_tabs.setTabEnabled(0, not audio_only) # Cropping
+        self.tools_tabs.setTabEnabled(1, not audio_only) # Scaling
 
     def adjust_and_warn_container_codec(self):
         """Validate container/codec pairings before building command; auto-correct invalid combos and collect warnings."""
@@ -2023,7 +2035,7 @@ class MainWindow(QMainWindow):
                 "progress_bg":"#F0F1F5","chunk_start":"#D1D5DB","chunk_mid":"#2563EB","chunk_end":"#D1D5DB",
                 "checkbox_border":"#2563EB","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#2563EB",
                 "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#D6CBA5",
-                "list_bg":"#F3F4F6","list_selected_bg":"#E5E7EB","list_selected_text":"#2563EB","list_hover_bg":"#E6DFC9","list_hover_text":"#111827",
+                "list_bg":"#F3F4F6","list_selected_bg":"#DAD2B9","list_selected_text":"#2563EB","list_hover_bg":"#E6DFC9","list_hover_text":"#111827",
                 "scroll_bg":"#FFFFFF","scroll_handle_bg":"#D1D5DB","scroll_handle_hover":"#2563EB",
                 "menu_bg":"#FFFFFF","menu_text":"#111827","menu_selected_bg":"#2563EB","menu_selected_text":"#FFF7E6",
                 "status_bg":"#FFFFFF","status_text":"#111827","status_border_top":"#2563EB",
@@ -2078,13 +2090,13 @@ class MainWindow(QMainWindow):
                 "bg":"#1A0933","text":"#FDEAFF","accent":"#7DF9FF","border":"#FF6EC7",
                 "tab_bg":"#2A124C","tab_selected_bg":"#3A1D66",
                 "button_bg":"#2A124C","button_text":"#FDEAFF","button_border":"#FF6EC7",
-                "surface_hover":"#3A1D66","surface_alt":"#110524",
-                "input_bg":"#2A124C","input_text":"#FDEAFF","input_border":"#FF6EC7","selection_bg":"#7DF9FF","focus_bg":"#3A1D66",
-                "progress_bg":"#120624","chunk_start":"#FF6EC7","chunk_mid":"#7DF9FF","chunk_end":"#FF6EC7",
+                "surface_hover":"#492C66","surface_alt":"#1A0E24",
+                "input_bg":"#2A124C","input_text":"#FDEAFF","input_border":"#FF6EC7","selection_bg":"#7DF9FF","focus_bg":"#492C66",
+                "progress_bg":"#1A0E24","chunk_start":"#FF6EC7","chunk_mid":"#7DF9FF","chunk_end":"#FF6EC7",
                 "checkbox_border":"#7DF9FF","checkbox_bg":"#2A173A","checkbox_checked_bg":"#7DF9FF",
-                "disabled_bg":"#3A1A1A","disabled_text":"#E7DDE4","disabled_border":"#3A1D66",
+                "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#D6CBA5",
                 "list_bg":"#2A124C","list_selected_bg":"#3A1D66","list_selected_text":"#7DF9FF","list_hover_bg":"#462A61","list_hover_text":"#FDEAFF",
-                "scroll_bg":"#120624","scroll_handle_bg":"#3A1D66","scroll_handle_hover":"#7DF9FF",
+                "scroll_bg":"#1A0E24","scroll_handle_bg":"#3A1D66","scroll_handle_hover":"#7DF9FF",
                 "menu_bg":"#2A173A","menu_text":"#FDEAFF","menu_selected_bg":"#7DF9FF","menu_selected_text":"#2A124C",
                 "status_bg":"#2A173A","status_text":"#FDEAFF","status_border_top":"#7DF9FF",
             },
@@ -2097,8 +2109,8 @@ class MainWindow(QMainWindow):
                 "input_bg":"#3B1717","input_text":"#FFF5E6","input_border":"#FF4D6D","selection_bg":"#FF8A00","focus_bg":"#5A2323",
                 "progress_bg":"#1D0A0A","chunk_start":"#FF4D6D","chunk_mid":"#FF8A00","chunk_end":"#FF4D6D",
                 "checkbox_border":"#FF8A00","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#FF8A00",
-                "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#4C566A",
-                "list_bg":"#3B1717","list_selected_bg":"#4C1E1E","list_selected_text":"#FF8A00","list_hover_bg":"#522222","list_hover_text":"#FFF5E6",
+                "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#D6CBA5",
+                "list_bg":"#3B1717","list_selected_bg":"#4C1E1E","list_selected_text":"#FF8A00","list_hover_bg":"#522A61","list_hover_text":"#FFF5E6",
                 "scroll_bg":"#1D0A0A","scroll_handle_bg":"#4C1E1E","scroll_handle_hover":"#FF8A00",
                 "menu_bg":"#2F1212","menu_text":"#FFF5E6","menu_selected_bg":"#FF8A00","menu_selected_text":"#3B1717",
                 "status_bg":"#2F1212","status_text":"#FFF5E6","status_border_top":"#FF8A00",
@@ -2142,7 +2154,7 @@ class MainWindow(QMainWindow):
                 "input_bg":"#311A40","input_text":"#FFF7FB","input_border":"#7CF0FF","selection_bg":"#FF5E99","focus_bg":"#492C66",
                 "progress_bg":"#1A0E24","chunk_start":"#7CF0FF","chunk_mid":"#FF5E99","chunk_end":"#7CF0FF",
                 "checkbox_border":"#FF5E99","checkbox_bg":"#2A173A","checkbox_checked_bg":"#FF5E99",
-                "disabled_bg":"#3A214D","disabled_text":"#E7DDE4","disabled_border":"#513069",
+                "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#D6CBA5",
                 "list_bg":"#311A40","list_selected_bg":"#3E2252","list_selected_text":"#FF5E99","list_hover_bg":"#462A61","list_hover_text":"#FFF7FB",
                 "scroll_bg":"#1A0E24","scroll_handle_bg":"#3E2252","scroll_handle_hover":"#FF5E99",
                 "menu_bg":"#2A173A","menu_text":"#FFF7FB","menu_selected_bg":"#FF5E99","menu_selected_text":"#311A40",

@@ -280,3 +280,41 @@ def build_ffmpeg_command(
 
     cmd.append(output_file)
     return cmd
+
+    # --- Audio Only Mode ---
+    if format_combo_text.startswith("Audio Only"):
+        # Determine output extension and codec
+        if "MP3" in format_combo_text:
+            output_ext = "mp3"
+            audio_codec = "libmp3lame"
+        elif "AAC" in format_combo_text:
+            output_ext = "aac"
+            audio_codec = "aac"
+        else:
+            output_ext = "mp3"
+            audio_codec = "libmp3lame"
+        # Force output file extension
+        if not output_file.lower().endswith(f".{output_ext}"):
+            output_file = os.path.splitext(output_file)[0] + f".{output_ext}"
+        cmd = ["ffmpeg", "-y", "-i", input_file, "-vn", "-acodec", audio_codec]
+        # Audio filters
+        audio_filters = []
+        if normalize:
+            audio_filters.append("dynaudnorm")
+        if normalize_ebu:
+            loudnorm_filter = f"loudnorm=I={ebu_target_loudness}:LRA=11:TP=-1.5"
+            audio_filters.append(loudnorm_filter)
+        if volume !=1.0:
+            audio_filters.append(f"volume={volume}")
+        if audio_filters:
+            cmd.extend(["-af", ",".join(audio_filters)])
+        # Bitrate
+        if adv_bitrate_value:
+            cmd.extend(["-b:a", f"{adv_bitrate_value}k"])
+        # Threads
+        if threads_value and threads_value >0:
+            cmd.extend(["-threads", str(threads_value)])
+        if extra_params_text.strip():
+            cmd.extend(extra_params_text.strip().split())
+        cmd.append(output_file)
+        return cmd
