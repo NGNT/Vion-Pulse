@@ -1,4 +1,4 @@
-# Vion Flux Video Converter
+# Vion Pulse Video Converter
 
 A powerful and user-friendly video conversion application built with Python and PyQt6, leveraging FFmpeg for high-quality video processing.
 
