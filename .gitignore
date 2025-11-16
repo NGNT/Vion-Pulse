@@ -24,14 +24,27 @@ wheels/
 venv/
 env/
 ENV/
+.venv/
 
 # IDE
 .idea/
 .vscode/
+.vs/
 *.swp
 *.swo
 *~
 .DS_Store
+
+# Visual Studio (user settings & profiler)
+*.user
+*.suo
+*.psess
+*.vsp
+*.vspx
+
+# Coverage
+.coverage
+htmlcov/
 
 # Project specific
 output/
