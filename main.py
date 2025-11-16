@@ -1,7 +1,7 @@
 import sys
 from PyQt6.QtWidgets import QApplication, QSplashScreen
 from PyQt6.QtGui import QPixmap
-from gui.main_window_old import MainWindow
+from gui.main_window import MainWindow
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

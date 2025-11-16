@@ -1,0 +1,2236 @@
+from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QWidget, QPushButton,
+                             QFileDialog, QLabel, QTabWidget, QComboBox, QSpinBox,
+                             QCheckBox, QGroupBox, QProgressBar, QMessageBox, QLineEdit, QPlainTextEdit,
+                             QListWidget, QListWidgetItem, QAbstractItemView, QSlider, QInputDialog,
+                             QDialog)
+from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QSettings, QUrl
+from PyQt6.QtGui import QAction, QPixmap, QActionGroup, QColor, QPainter, QLinearGradient
+try:
+ from PyQt6.QtQuickWidgets import QQuickWidget
+except Exception:
+ QQuickWidget = None
+import os
+import subprocess
+import json # added for probing helper that parses ffprobe json
+from typing import Dict
+from gui.conversion_thread import ConversionThread
+from gui.input_probe_worker import InputProbeWorker
+from gui.output_postprocess_worker import OutputPostProcessWorker
+from gui.probe import (
+ probe_attached_pictures as probe_cover,
+ get_video_duration as probe_duration,
+ get_subtitle_streams as probe_subs,
+ get_audio_streams as probe_audio,
+ quick_probe_field_order as probe_field_order,
+ detect_interlacing as probe_detect_interlace,
+ get_video_resolution_and_codec as probe_resolution_codec,
+)
+from gui.hw import get_available_hw_accels as hw_get_available_hw_accels, get_ffmpeg_hw_accel_args as hw_get_ffmpeg_hw_accel_args
+from gui.path_utils import _escape_path_for_subtitles_filter
+from gui.bitrate import estimate_video_bitrate_from_size as estimate_bitrate_from_size
+from gui.container_rules import handle_format_changed, adjust_and_warn_container_codec
+from gui.command_builder import build_ffmpeg_command
+from gui.bitrate_estimate_worker import BitrateEstimateWorker
+from gui.video_preview_worker import VideoPreviewManager
+from gui.cropping_worker import CroppingWidget, CroppingManager
+from gui.scaling_worker import ScalingWidget, ScalingManager
+from gui.audio_worker import AudioSettingsWidget
+from gui.batch_manager import BatchConversionManager, TimeRemainingManager
+from gui.audio_analysis_worker import AudioAnalysisWorker
+from gui.disc_import_tab import DiscImportTab
+
+class MainWindow(QMainWindow):
+    SUPPORTED_VIDEO_FORMATS = [
+        # Common / Modern
+        '.mp4', '.mkv', '.mov', '.avi', '.wmv', '.flv', '.webm', '.m4v', '.ts', '.m2ts',
+        '.3gp', '.3g2', '.f4v', '.ogv',
+        # Professional
+        '.mxf',
+        # Legacy
+        '.mpg', '.mpeg', '.asf', '.rm', '.rmvb', '.vob', '.dat', '.dvr-ms', '.wtv', '.apng', '.gif', '.mj2',
+        # Game formats
+        '.bik', '.smk'
+    ]
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Vion Flux Video Converter")
+        self.setMinimumSize(1300,850)
+        self.resize(1280,720)
+        self.setAcceptDrops(True)
+        # Theme system state
+        self._base_qss = None
+        self._themes = {}
+        self._theme_actions = {}
+        self._theme_name = None
+        self._init_theme_system()
+        # Initialize variables
+        self.input_files = []  # Now a list of dicts: [{'path': str, 'settings': dict}]
+        self.output_dir = ""
+        self._output_path_is_custom = False # Track if user set output path manually
+        self._last_warnings = [] # store auto-adjust warnings
+        self._input_attached_pics = []
+        self._subtitle_meta = []
+        self._audio_meta = []
+        self._subtitle_method_widgets = {} # original_index -> QComboBox for per-subtitle method
+        # probe worker/thread
+        self._probe_thread = None
+        self._probe_worker = None
+        self.conversion_thread = None
+        self._input_duration =0.0
+        self._input_resolution = None # (width, height) from probe
+        self._audio_analysis_thread = None
+        self._audio_analysis_worker = None
+        
+        # Initialize managers and widgets that don't depend on the main UI
+        self.batch_manager = BatchConversionManager()
+        self.preview_manager = VideoPreviewManager(log_callback=self.log)
+        self.cropping_manager = CroppingManager(log_callback=self.log)
+        self.cropping_widget = CroppingWidget()
+        self.scaling_manager = ScalingManager(log_callback=self.log)
+        self.scaling_widget = ScalingWidget()
+
+        # Set up the UI
+        self.setup_ui()
+        self.setup_menu()
+
+        # Apply saved theme after menus exist
+        try:
+            saved = QSettings("NGNT", "VionFlux").value("theme", type=str)
+            if saved and saved in self._themes:
+                self.apply_theme(saved)
+            else:
+                self.apply_theme("Twilight")
+        except Exception:
+            self.apply_theme("Twilight")
+ 
+ # Now that UI elements exist, connect signals
+        self.batch_manager.log_message.connect(self.log)
+        self.batch_manager.batch_finished.connect(self.batch_finished)
+        self.batch_manager.file_progress.connect(self.progress_bar.setValue)
+        self.batch_manager.time_remaining_updated.connect(self.update_time_remaining_display)
+        self.batch_manager.batch_progress.connect(self.update_batch_progress_display)
+        
+        self._crop_debounce_timer = QTimer(self)
+        self._crop_debounce_timer.setSingleShot(True)
+        self._crop_debounce_timer.timeout.connect(self._run_debounced_crop_detection)
+        
+        try:
+            self.scaling_widget.settings_changed.connect(self._on_scaling_settings_changed)
+        except Exception:
+            pass
+        
+    def resizeEvent(self, event):
+        """Handle window resize events to dynamically adjust layout."""
+        if event:  # Prevent crash on initial call with None
+            super().resizeEvent(event)
+
+        # If panels are not yet created, do nothing
+        if not hasattr(self, 'left_panel') or not hasattr(self, 'right_panel'):
+            return
+
+        width = self.width()
+        # Threshold for switching between horizontal and vertical layouts
+        threshold = 1000 
+
+        current_layout = self.main_widget.layout()
+
+        if width < threshold:
+            # Switch to Vertical Layout if not already
+            if current_layout != self.v_layout:
+                # Move widgets from H layout to V layout
+                self.h_layout.removeWidget(self.left_panel)
+                self.h_layout.removeWidget(self.right_panel)
+                self.v_layout.addWidget(self.left_panel)
+                self.v_layout.addWidget(self.right_panel)
+                self.main_widget.setLayout(self.v_layout)
+        else:
+            # Switch to Horizontal Layout if not already
+            if current_layout != self.h_layout:
+                # Move widgets from V layout to H layout
+                self.v_layout.removeWidget(self.left_panel)
+                self.v_layout.removeWidget(self.right_panel)
+                self.h_layout.addWidget(self.left_panel, 2)
+                self.h_layout.addWidget(self.right_panel, 3)
+                self.main_widget.setLayout(self.h_layout)
+
+    def log(self, msg: str):
+        try:
+            if hasattr(self, 'log_view') and self.log_view is not None:
+                self.log_view.appendPlainText(msg)
+                print(msg, flush=True)
+        except Exception:
+            pass
+
+    # --- Probing wrappers using worker module ---
+    def probe_attached_pictures(self, file_path: str):
+        return probe_cover(file_path, self.log)
+
+    def get_video_duration(self, file_path: str) -> float:
+        return probe_duration(file_path, self.log)
+
+    def get_subtitle_streams(self, file_path: str):
+        display, meta = probe_subs(file_path, self.log)
+        self._subtitle_meta = meta
+        return display
+
+    def get_audio_streams(self, file_path: str):
+        meta = probe_audio(file_path, self.log)
+        self._audio_meta = meta
+        return meta
+
+    def quick_probe_field_order(self, file_path: str):
+        return probe_field_order(file_path, self.log)
+
+    def detect_interlacing(self, file_path: str) -> str:
+        return probe_detect_interlace(file_path, self.log)
+
+    def escape_path_for_subtitles_filter(self, path: str) -> str:
+        return _escape_path_for_subtitles_filter(path)
+
+    def estimate_video_bitrate_from_size(self, input_file, get_duration_fn, target_size_mb, audio_bitrate_text, log_fn):
+        return estimate_bitrate_from_size(input_file, get_duration_fn, target_size_mb, audio_bitrate_text, log_fn)
+
+    # Existing methods below, updated to use probe helpers
+    def setup_ui(self):
+        """Set up the main UI components (with responsive layout)"""
+        # Create the main tab widget that will hold everything
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        # --- Converter Tab ---
+        self.main_widget = QWidget() # This is now the "Video Converter" tab content
+        self.tabs.addTab(self.main_widget, "Video Converter")
+
+        # Create both horizontal and vertical layouts for the converter tab
+        self.h_layout = QHBoxLayout()
+        self.v_layout = QVBoxLayout()
+
+        # --- Left panel: Settings ---
+        self.left_panel = QWidget()
+        left_layout = QVBoxLayout(self.left_panel)
+
+        # Header logo: use tintable QLabel-based logo (robust, no QML dependency)
+        self.logo_widget = None # Keep attribute for compatibility
+        self.logo_label = QLabel()
+        self.logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Resolve logo path and keep base pixmap
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            self._logo_path = os.path.join(project_root, 'img', 'logo2.png')
+            base_pm = QPixmap(self._logo_path)
+            if not base_pm or base_pm.isNull():
+                # Fallback to old path
+                base_pm = QPixmap('img/logo2.png')
+            # Scale a default preview; real tint will be applied on theme
+            if base_pm and not base_pm.isNull():
+                self.logo_label.setPixmap(base_pm.scaledToHeight(80, Qt.TransformationMode.SmoothTransformation))
+            else:
+                self.logo_label.setText("Vion Pulse Video Converter")
+                self.logo_label.setStyleSheet("font-size:16px; font-weight: bold; margin:5px;")
+        except Exception:
+            self._logo_path = 'img/logo2.png'
+            self.logo_label.setText("Vion Pulse Video Converter")
+            self.logo_label.setStyleSheet("font-size:16px; font-weight: bold; margin:5px;")
+        left_layout.addWidget(self.logo_label)
+
+        # Input/Output section
+        io_group = QGroupBox("Input / Output")
+        io_layout = QVBoxLayout()
+        
+        # Input file list
+        input_list_layout = QVBoxLayout()
+        input_list_layout.addWidget(QLabel("Input Files:"))
+        self.input_files_list_widget = QListWidget()
+        self.input_files_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        input_list_layout.addWidget(self.input_files_list_widget)
+        # Connect selection change to info update
+        self.input_files_list_widget.currentRowChanged.connect(self._on_input_file_selected)
+        
+        input_buttons_layout = QHBoxLayout()
+        add_files_btn = QPushButton("Add Files")
+        add_files_btn.clicked.connect(self.select_input_files)
+        remove_selected_btn = QPushButton("Remove Selected")
+        remove_selected_btn.clicked.connect(self.remove_selected_files)
+        clear_list_btn = QPushButton("Clear List")
+        clear_list_btn.clicked.connect(self.clear_input_files)
+        save_settings_btn = QPushButton("Save Settings for Selected")
+        save_settings_btn.clicked.connect(self.save_settings_for_selected_file)
+        input_buttons_layout.addWidget(add_files_btn)
+        input_buttons_layout.addWidget(remove_selected_btn)
+        input_buttons_layout.addWidget(clear_list_btn)
+        input_buttons_layout.addWidget(save_settings_btn)
+        input_list_layout.addLayout(input_buttons_layout)
+        
+        # Output directory selection
+        output_layout = QHBoxLayout()
+        self.output_dir_label = QLabel("No output directory selected")
+        output_btn = QPushButton("Select Output Directory")
+        output_btn.clicked.connect(self.select_output_directory)
+        output_layout.addWidget(QLabel("Output Directory:"))
+        output_layout.addWidget(self.output_dir_label, 1)
+        output_layout.addWidget(output_btn)
+        
+        # Input file info (now for the first file)
+        info_layout = QVBoxLayout()
+        self.duration_label = QLabel("Duration: N/A")
+        self.size_label = QLabel("File Size: N/A")
+        self.bitrate_label = QLabel("Bitrate: N/A")
+        self.resolution_label = QLabel("Resolution: N/A")
+        self.codec_label = QLabel("Video Codec: N/A")
+        info_layout.addWidget(self.duration_label)
+        info_layout.addWidget(self.size_label)
+        info_layout.addWidget(self.bitrate_label)
+        info_layout.addWidget(self.resolution_label)
+        info_layout.addWidget(self.codec_label)
+        
+        io_layout.addLayout(input_list_layout)
+        io_layout.addLayout(output_layout)
+        io_layout.addLayout(info_layout)
+        io_group.setLayout(io_layout)
+        left_layout.addWidget(io_group)
+
+        # Format selection
+        format_group = QGroupBox("Output Format")
+        format_layout = QHBoxLayout()
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["MP4", "MKV", "AVI", "MOV", "WebM", "FLV", "WMV", "TS", "M4V", "MPG", "VOB"])
+        format_layout.addWidget(QLabel("Format:"))
+        format_layout.addWidget(self.format_combo,1)
+        format_group.setLayout(format_layout)
+        left_layout.addWidget(format_group)
+
+        # Settings tabs (video/audio/advanced/subtitles)
+        self.settings_tabs = QTabWidget()
+        self.setup_video_tab(target_tabs=self.settings_tabs)
+        self.setup_audio_tab(target_tabs=self.settings_tabs)
+        self.setup_advanced_tab(target_tabs=self.settings_tabs)
+        self.setup_subtitles_tab(target_tabs=self.settings_tabs)
+        left_layout.addWidget(self.settings_tabs,1)
+
+        # Progress bar and labels
+        progress_layout = QGridLayout()
+        self.batch_progress_label = QLabel("Idle")
+        self.time_remaining_label = QLabel("")
+        self.time_remaining_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        progress_layout.addWidget(self.batch_progress_label, 0, 0)
+        progress_layout.addWidget(self.time_remaining_label, 0, 1)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        progress_layout.addWidget(self.progress_bar, 1, 0, 1, 2)
+        left_layout.addLayout(progress_layout)
+
+
+        # Control buttons
+        control_layout = QHBoxLayout()
+        self.start_btn = QPushButton("Start")
+        self.start_btn.clicked.connect(self.start_conversion)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_conversion)
+        control_layout.addStretch(); control_layout.addWidget(self.cancel_btn); control_layout.addWidget(self.start_btn)
+        left_layout.addLayout(control_layout)
+
+        # --- Right panel: Tools/Preview/Log ---
+        self.right_panel = QWidget()
+        right_layout = QVBoxLayout(self.right_panel)
+
+        self.tools_tabs = QTabWidget()
+        # Create a persistent preview panel that is always visible above the other tool tabs
+        preview_group = QGroupBox("Output Preview")
+        preview_layout = QVBoxLayout()
+        desc_label = QLabel("This preview shows how your converted video will look with current settings.")
+        desc_label.setStyleSheet("font-style: italic; color: #666;")
+        preview_layout.addWidget(desc_label)
+        update_btn = QPushButton("Update Preview")
+        update_btn.clicked.connect(lambda: self.update_preview(self.input_files[0]['path']) if self.input_files else None)
+        preview_layout.addWidget(update_btn)
+        # Container for generated preview widgets
+        self.preview_layout = QVBoxLayout()
+        preview_layout.addLayout(self.preview_layout)
+        preview_group.setLayout(preview_layout)
+        # Add persistent preview to right panel
+        right_layout.addWidget(preview_group,1)
+
+        # Now add the tool tabs (cropping, scaling, etc.) below the preview
+        self.setup_cropping_tab(target_tabs=self.tools_tabs)
+        self.setup_scaling_tab(target_tabs=self.tools_tabs)
+        self.setup_audio_analysis_tab(target_tabs=self.tools_tabs)
+        right_layout.addWidget(self.tools_tabs,2)
+
+        # Log panel
+        log_group = QGroupBox("Log Output")
+        log_layout = QVBoxLayout()
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(5000)
+        log_layout.addWidget(self.log_view)
+        log_group.setLayout(log_layout)
+        right_layout.addWidget(log_group,1)
+
+        # Add panels to the horizontal layout by default and set it
+        self.h_layout.addWidget(self.left_panel, 2)
+        self.h_layout.addWidget(self.right_panel, 3)
+        self.main_widget.setLayout(self.h_layout)
+
+        # Set initial layout based on window size
+        self.resizeEvent(None)
+
+        # Connect format change for sensible defaults
+        self.format_combo.currentTextChanged.connect(self.handle_format_changed)
+
+        # --- Disc/ISO Import Tab ---
+        self.import_tab = DiscImportTab(self.SUPPORTED_VIDEO_FORMATS)
+        self.tabs.addTab(self.import_tab, "Disc / ISO Import")
+
+        # Connect signals from the import tab
+        self.import_tab.files_extracted.connect(self._on_import_files_extracted)
+        self.import_tab.log_message.connect(self.log) # Route log messages to main log view
+
+    def handle_format_changed(self):
+        """Apply sensible default codecs when container changes without overriding deliberate user choices too aggressively."""
+        handle_format_changed(
+            self.format_combo.currentText(),
+            lambda: self.video_codec.currentText(),
+            lambda text: self.video_codec.setCurrentText(text),
+            lambda: self.audio_settings_widget.audio_codec.currentText(),
+            lambda text: self.audio_settings_widget.audio_codec.setCurrentText(text),
+            self._last_warnings
+        )
+
+    def adjust_and_warn_container_codec(self):
+        """Validate container/codec pairings before building command; auto-correct invalid combos and collect warnings."""
+        adjust_and_warn_container_codec(
+            self.format_combo.currentText(),
+            lambda: self.video_codec.currentText(),
+            lambda text: self.video_codec.setCurrentText(text),
+            lambda: self.audio_settings_widget.audio_codec.currentText(),
+            lambda text: self.audio_settings_widget.audio_codec.setCurrentText(text),
+            self._last_warnings
+        )
+
+    def setup_video_tab(self, target_tabs):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        video_group = QGroupBox("Video Settings")
+        grid = QGridLayout()
+
+        # Video codec
+        grid.addWidget(QLabel("Video Codec:"),0,0)
+        self.video_codec = QComboBox()
+        self.video_codec.addItems(["H.264", "H.265 (HEVC)", "VP9", "AV1"])
+        grid.addWidget(self.video_codec,0,1)
+
+        # Conversion Speed
+        grid.addWidget(QLabel("Conversion Speed:"),1,0)
+        self.preset = QComboBox()
+        self.preset.addItems(["Ultrafast", "Superfast", "Veryfast", "Faster", "Fast", 
+                            "Medium", "Slow", "Slower", "Veryslow"])
+        self.preset.setCurrentText("Medium")
+        self.preset.setToolTip("Encoding speed vs quality trade-off. Automatically mapped to hardware-specific presets when using GPU acceleration.")
+        grid.addWidget(self.preset,1,1)
+
+        # Resolution
+        grid.addWidget(QLabel("Resolution:"),2,0)
+        self.resolution = QComboBox()
+        self.resolution.addItems(["Original", "4K (2160p)", "1440p", "1080p", "720p", "480p"])
+        grid.addWidget(self.resolution,2,1)
+
+        # Frame Rate
+        grid.addWidget(QLabel("Frame Rate:"),3,0)
+        self.framerate = QComboBox()
+        self.framerate.addItems(["Original", "60", "59.94", "50", "30", "29.97", "25", "24"])
+        grid.addWidget(self.framerate,3,1)
+
+        # Framerate mode
+        grid.addWidget(QLabel("Framerate Mode:"),4,0)
+        self.framerate_mode = QComboBox()
+        self.framerate_mode.addItems(["Same as source", "Constant", "Peak (variable)"])
+        grid.addWidget(self.framerate_mode,4,1)
+
+        # Deinterlace option
+        self.deinterlace_checkbox = QCheckBox("Deinterlace video (bwdif)")
+        self.deinterlace_checkbox.setToolTip("Use high-quality bwdif deinterlacing to remove horizontal combing lines from interlaced sources.")
+        grid.addWidget(self.deinterlace_checkbox,5,0,1,2)
+        # Auto-detect toggle
+        self.deinterlace_auto_checkbox = QCheckBox("Auto-detect when needed")
+        self.deinterlace_auto_checkbox.setToolTip("Detect interlacing via ffprobe/idet and enable deinterlace only if needed.")
+        self.deinterlace_auto_checkbox.setChecked(True)
+        grid.addWidget(self.deinterlace_auto_checkbox,6,0,1,2)
+
+        video_group.setLayout(grid)
+        layout.addWidget(video_group)
+        layout.addStretch()
+
+        target_tabs.addTab(tab, "Video")
+    
+    def setup_audio_tab(self, target_tabs):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.audio_settings_widget = AudioSettingsWidget()
+        layout.addWidget(self.audio_settings_widget)
+        layout.addStretch()
+        target_tabs.addTab(tab, "Audio")
+    
+    def setup_advanced_tab(self, target_tabs):
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+
+        # Use sub-tabs inside Advanced to declutter and improve discoverability
+        advanced_tabs = QTabWidget()
+
+        # --- Encoding Tab ---
+        enc_tab = QWidget()
+        enc_layout = QVBoxLayout(enc_tab)
+
+        # Rate Control group
+        rate_group = QGroupBox("Rate Control")
+        rate_grid = QGridLayout()
+        rate_grid.addWidget(QLabel("Quality Mode:"),0,0)
+        self.quality_mode = QComboBox()
+        self.quality_mode.addItems(["Constant Quality (CRF)", "Average Bitrate (kbps)", "Variable Bitrate (VBR)"])
+        rate_grid.addWidget(self.quality_mode,0,1)
+
+        self.crf_label = QLabel("CRF (0-51):")
+        self.crf_label.setToolTip("Lower values mean better quality. Not applicable for most hardware encoders.")
+        rate_grid.addWidget(self.crf_label,1,0)
+        self.crf = QSpinBox(); self.crf.setRange(0,51); self.crf.setValue(23)
+        rate_grid.addWidget(self.crf,1,1)
+
+        self.adv_bitrate_label = QLabel("Avg Bitrate (kbps):")
+        rate_grid.addWidget(self.adv_bitrate_label,2,0)
+        self.adv_bitrate = QSpinBox(); self.adv_bitrate.setRange(100,100000); self.adv_bitrate.setValue(5000)
+        rate_grid.addWidget(self.adv_bitrate,2,1)
+
+        self.vbr_target_label = QLabel("VBR Target (kbps):")
+        rate_grid.addWidget(self.vbr_target_label,0,2)
+        self.vbr_target = QSpinBox(); self.vbr_target.setRange(100,100000); self.vbr_target.setValue(5000)
+        rate_grid.addWidget(self.vbr_target,0,3)
+
+        self.vbr_max_label = QLabel("VBR Max (kbps):")
+        rate_grid.addWidget(self.vbr_max_label,1,2)
+        self.vbr_max = QSpinBox(); self.vbr_max.setRange(100,100000); self.vbr_max.setValue(8000)
+        rate_grid.addWidget(self.vbr_max,1,3)
+
+        self.vbr_min_label = QLabel("VBR Min (kbps):")
+        rate_grid.addWidget(self.vbr_min_label,2,2)
+        self.vbr_min = QSpinBox(); self.vbr_min.setRange(100,100000); self.vbr_min.setValue(2000)
+        rate_grid.addWidget(self.vbr_min,2,3)
+
+        self.two_pass_checkbox = QCheckBox("Enable Two-Pass Encoding")
+        self.two_pass_checkbox.setToolTip("Improves quality for a target bitrate, but is slower. Only for bitrate-based modes.")
+        rate_grid.addWidget(self.two_pass_checkbox,3,0,1,4)
+        rate_group.setLayout(rate_grid)
+        enc_layout.addWidget(rate_group)
+
+        # Performance & Extras group
+        perf_group = QGroupBox("Performance & Extras")
+        perf_grid = QGridLayout()
+        perf_grid.addWidget(QLabel("Threads (0=auto):"),0,0)
+        self.threads = QSpinBox(); self.threads.setRange(0,64); self.threads.setValue(0)
+        perf_grid.addWidget(self.threads,0,1)
+
+        perf_grid.addWidget(QLabel("Extra FFmpeg params:"),1,0)
+        self.extra_params = QLineEdit()
+        perf_grid.addWidget(self.extra_params,1,1,1,3)
+        perf_group.setLayout(perf_grid)
+        enc_layout.addWidget(perf_group)
+        enc_layout.addStretch()
+
+        # Do not add Encoding tab yet; add after Hardware so Hardware appears first
+        # advanced_tabs.addTab(enc_tab, "Encoding")
+
+        # --- Hardware Tab ---
+        hw_tab = QWidget()
+        hw_layout = QVBoxLayout(hw_tab)
+
+        hw_group = QGroupBox("Hardware Acceleration")
+        hw_grid = QGridLayout()
+        self.hw_accel_combo = QComboBox()
+        for name, _ in self.get_available_hw_accels():
+            self.hw_accel_combo.addItem(name)
+        hw_grid.addWidget(QLabel("Hardware Encoder:"),0,0)
+        hw_grid.addWidget(self.hw_accel_combo,0,1)
+        
+        self.hw_decode_checkbox = QCheckBox("Use hardware decoding (if available)")
+        self.hw_decode_checkbox.setChecked(False)
+        hw_grid.addWidget(self.hw_decode_checkbox, 1, 0, 1, 2)
+        
+        self.hw_scale_checkbox = QCheckBox("Use GPU-accelerated scaling (if available)")
+        self.hw_scale_checkbox.setToolTip("Uses scale_npp (CUDA) or scale_qsv when compatible. Not used with burn-in subtitles or deinterlacing.")
+        self.hw_scale_checkbox.setChecked(False)
+        hw_grid.addWidget(self.hw_scale_checkbox, 2, 0, 1, 2)
+        hw_group.setLayout(hw_grid)
+        hw_layout.addWidget(hw_group)
+        hw_layout.addStretch()
+
+        # First add Hardware, then Encoding
+        advanced_tabs.addTab(hw_tab, "Hardware")
+        advanced_tabs.addTab(enc_tab, "Encoding")
+
+        # --- Size & Misc Tab ---
+        size_tab = QWidget()
+        size_layout_outer = QVBoxLayout(size_tab)
+
+        size_group = QGroupBox("Target Size Estimator")
+        size_layout = QGridLayout()
+        size_layout.addWidget(QLabel("Desired Output Size (MB):"),0,0)
+        self.target_size_mb = QSpinBox(); self.target_size_mb.setRange(10,100000); self.target_size_mb.setValue(1000); size_layout.addWidget(self.target_size_mb,0,1)
+        self.estimate_btn = QPushButton("Estimate Video Bitrate")
+        size_layout.addWidget(self.estimate_btn,1,0,1,2)
+        self.estimate_result_label = QLabel("Suggestion: (press button)")
+        size_layout.addWidget(self.estimate_result_label,2,0,1,2)
+        size_group.setLayout(size_layout)
+        size_layout_outer.addWidget(size_group)
+
+        # Cover art preservation toggle
+        self.preserve_cover_art_checkbox = QCheckBox("Preserve cover art / attached pictures")
+        self.preserve_cover_art_checkbox.setChecked(True)
+        self.preserve_cover_art_checkbox.setToolTip("If unchecked, attached cover art images will be discarded from output container.")
+        size_layout_outer.addWidget(self.preserve_cover_art_checkbox)
+        size_layout_outer.addStretch()
+
+        advanced_tabs.addTab(size_tab, "Size & Misc")
+
+        # Add sub-tabs to Advanced main layout
+        main_layout.addWidget(advanced_tabs)
+
+        # Connect estimator
+        self.estimate_btn.clicked.connect(self.on_estimate_bitrate_clicked)
+
+        # Connect quality mode UI updates
+        self.quality_mode.currentTextChanged.connect(self._update_quality_options_ui)
+        # Also connect index change for robustness across Qt versions
+        try:
+            self.quality_mode.currentIndexChanged.connect(lambda _: self._update_quality_options_ui())
+        except Exception:
+            pass
+        self.hw_accel_combo.currentTextChanged.connect(self._update_quality_options_ui)
+        self._update_quality_options_ui() # Initial state
+
+        target_tabs.addTab(tab, "Advanced")
+
+    def _update_quality_options_ui(self):
+        """Enable/disable quality-related spinboxes based on selected quality mode and hardware acceleration."""
+        quality_mode = self.quality_mode.currentText()
+        hw_accel = self.hw_accel_combo.currentText()
+        is_hw_accel = hw_accel != "Software (CPU)"
+
+        # Determine enabled state for each mode
+        crf_enabled = (quality_mode == "Constant Quality (CRF)") and not is_hw_accel
+        avg_bitrate_enabled = (quality_mode == "Average Bitrate (kbps)")
+        vbr_enabled = (quality_mode == "Variable Bitrate (VBR)")
+
+        # Apply states to CRF controls
+        self.crf_label.setEnabled(crf_enabled)
+        self.crf.setEnabled(crf_enabled)
+
+        # Apply states to Average Bitrate controls
+        self.adv_bitrate_label.setEnabled(avg_bitrate_enabled)
+        self.adv_bitrate.setEnabled(avg_bitrate_enabled)
+
+        # Apply states to VBR controls
+        self.vbr_target_label.setEnabled(vbr_enabled)
+        self.vbr_target.setEnabled(vbr_enabled)
+        self.vbr_max_label.setEnabled(vbr_enabled)
+        self.vbr_max.setEnabled(vbr_enabled)
+        self.vbr_min_label.setEnabled(vbr_enabled)
+        self.vbr_min.setEnabled(vbr_enabled)
+
+        # Two-pass is only relevant for bitrate-based modes
+        self.two_pass_checkbox.setEnabled(avg_bitrate_enabled or vbr_enabled)
+        if not self.two_pass_checkbox.isEnabled():
+            self.two_pass_checkbox.setChecked(False)
+
+        # If HW accel is on, CRF is disabled with a tooltip explaining why
+        if is_hw_accel:
+            self.crf.setToolTip("CRF is not applicable for most hardware encoders. Quality is controlled by the 'Preset' or is implicitly managed.")
+        else:
+            self.crf.setToolTip("")
+
+    def on_estimate_bitrate_clicked(self):
+        """Estimate required video bitrate (kbps) to reach target size considering audio bitrate using worker."""
+        if not self.input_files:
+            QMessageBox.warning(self, "No Input File", "Please add an input file to estimate the bitrate.")
+            return
+
+        # Disable button to prevent double-click
+        self.estimate_btn.setEnabled(False)
+        # Start worker in thread
+        self._bitrate_thread = QThread()
+        self._bitrate_worker = BitrateEstimateWorker(
+            self.input_files[0]['path'],
+            self.get_video_duration,
+            self.target_size_mb.value(),
+            self.audio_settings_widget.audio_bitrate.currentText()
+        )
+        self._bitrate_worker.moveToThread(self._bitrate_thread)
+        self._bitrate_worker.estimated.connect(self._on_bitrate_estimated)
+        self._bitrate_worker.error.connect(self._on_bitrate_error)
+        self._bitrate_worker.log.connect(self.log)
+        self._bitrate_worker.finished.connect(self._cleanup_bitrate_worker)
+        self._bitrate_thread.started.connect(self._bitrate_worker.run)
+        self._bitrate_thread.start()
+
+    def _on_bitrate_estimated(self, video_kbps, audio_kbps):
+        self.adv_bitrate.setValue(video_kbps)
+        self.estimate_result_label.setText(f"Suggestion: Video {video_kbps} kbps (Audio {audio_kbps} kbps, Total ~{int(video_kbps+audio_kbps)} kbps)")
+
+    def _on_bitrate_error(self, msg):
+        QMessageBox.warning(self, "Bitrate Estimation Error", msg)
+        self.estimate_result_label.setText(f"Error: {msg}")
+
+    def _cleanup_bitrate_worker(self):
+        self.estimate_btn.setEnabled(True)
+        try:
+            if hasattr(self, '_bitrate_thread') and self._bitrate_thread:
+                self._bitrate_thread.quit()
+                self._bitrate_thread.wait(1000)
+        except Exception:
+            pass
+        self._bitrate_worker = None
+        self._bitrate_thread = None
+
+    def setup_subtitles_tab(self, target_tabs):
+        """Set up the subtitles settings tab (checkboxes removed; use row selection)."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+ 
+        subtitle_group = QGroupBox("Subtitle Streams")
+        vbox = QVBoxLayout()
+        self.subtitle_streams_list = QListWidget()
+        # Multi-row selection; rows highlight when selected
+        self.subtitle_streams_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection) # Selection handled by checkboxes
+        self.subtitle_streams_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.subtitle_streams_list.setAlternatingRowColors(True)
+        self.subtitle_streams_list.setMinimumHeight(100)
+        vbox.addWidget(QLabel("Subtitle stream(s):"))
+        vbox.addWidget(self.subtitle_streams_list)
+        subtitle_group.setLayout(vbox)
+        layout.addWidget(subtitle_group)
+
+        layout.addStretch()
+ 
+        target_tabs.addTab(tab, "Subtitles")
+    
+    def setup_preview_tab(self, target_tabs):
+        """Legacy: builds a preview tab (no longer used by default). Kept for compatibility."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        preview_group = QGroupBox("Output Preview")
+        preview_layout = QVBoxLayout()
+        desc_label = QLabel("This preview shows how your converted video will look with current settings.")
+        desc_label.setStyleSheet("font-style: italic; color: #666;")
+        preview_layout.addWidget(desc_label)
+        update_btn = QPushButton("Update Preview")
+        update_btn.clicked.connect(lambda: self.update_preview(self.input_files[0]['path']) if self.input_files else None)
+        preview_layout.addWidget(update_btn)
+        # If persistent preview already exists, reuse its layout; otherwise create local container
+        if hasattr(self, 'preview_layout') and isinstance(self.preview_layout, QVBoxLayout):
+            preview_layout.addLayout(self.preview_layout)
+        else:
+            local_preview_layout = QVBoxLayout()
+            preview_layout.addLayout(local_preview_layout)
+            self.preview_layout = local_preview_layout
+        preview_group.setLayout(preview_layout)
+        layout.addWidget(preview_group)
+        layout.addStretch()
+        target_tabs.addTab(tab, "Preview")
+    
+    def setup_cropping_tab(self, target_tabs):
+        """Set up the cropping tab."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(self.cropping_widget)
+        layout.addStretch()
+        target_tabs.addTab(tab, "Cropping")
+        
+        # Connect crop detection to widget
+        self.cropping_manager.cropping_detected.connect(self.cropping_widget.set_detected_crop)
+        self.cropping_manager.cropping_detected.connect(self._on_crop_detected_main)
+
+    def setup_scaling_tab(self, target_tabs):
+        """Set up the scaling tab."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(self.scaling_widget)
+        layout.addStretch()
+        target_tabs.addTab(tab, "Scaling")
+        
+        # Connect scaling detection to widget
+        self.scaling_manager.scaling_detected.connect(self._on_scaling_detected_main)
+        
+    def setup_audio_analysis_tab(self, target_tabs):
+        """Set up the audio analysis tab."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # Analyze button
+        analyze_btn = QPushButton("Analyze Audio")
+        analyze_btn.setToolTip("Run a full analysis of the audio stream to generate a waveform and loudness statistics.")
+        analyze_btn.clicked.connect(self.start_audio_analysis)
+        layout.addWidget(analyze_btn)
+
+        # Waveform display
+        waveform_group = QGroupBox("Audio Waveform")
+        waveform_layout = QVBoxLayout()
+        self.waveform_label = QLabel("No audio analyzed.")
+        self.waveform_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.waveform_label.setMinimumHeight(140)
+        waveform_layout.addWidget(self.waveform_label)
+        waveform_group.setLayout(waveform_layout)
+        layout.addWidget(waveform_group)
+
+        # EBU R128 Stats
+        stats_group = QGroupBox("EBU R128 Loudness Stats")
+        stats_layout = QGridLayout()
+        self.integrated_loudness_label = QLabel("Integrated Loudness: N/A")
+        self.loudness_range_label = QLabel("Loudness Range: N/A")
+        self.true_peak_label = QLabel("True Peak: N/A")
+        stats_layout.addWidget(self.integrated_loudness_label, 0, 0)
+        stats_layout.addWidget(self.loudness_range_label, 1, 0)
+        stats_layout.addWidget(self.true_peak_label, 2, 0)
+        stats_group.setLayout(stats_layout)
+        layout.addWidget(stats_group)
+
+        # Normalization options
+        norm_group = QGroupBox("Loudness Normalization")
+        norm_layout = QGridLayout()
+        self.normalize_ebu_checkbox = QCheckBox("Apply EBU R128 Normalization")
+        self.normalize_ebu_checkbox.setToolTip("Adjust audio to broadcast loudness standards (EBU R128).")
+        norm_layout.addWidget(self.normalize_ebu_checkbox, 0, 0, 1, 2)
+        
+        norm_layout.addWidget(QLabel("Target Loudness (LUFS):"), 1, 0)
+        self.ebu_target_loudness = QSpinBox()
+        self.ebu_target_loudness.setRange(-70, 0)
+        self.ebu_target_loudness.setValue(-23)
+        self.ebu_target_loudness.setToolTip("Target integrated loudness in LUFS.")
+        norm_layout.addWidget(self.ebu_target_loudness, 1, 1)
+
+        norm_group.setLayout(norm_layout)
+        layout.addWidget(norm_group)
+
+        layout.addStretch()
+        target_tabs.addTab(tab, "Audio Analysis")
+
+    def select_crop_area(self):
+        """Open crop area selector dialog, updates hidden fields for top/bottom/left/right, shows preview animation."""
+        if not self.input_files or not self.input_files[0] or not os.path.isfile(self.input_files[0]['path']):
+            QMessageBox.warning(self, "No Input File", "Please select a valid input file first.")
+            return
+        
+        # Stop any ongoing animation before starting a new selection
+        self.preview_manager.stop_preview()
+        
+        # Clear previous crop values
+        self.crop_top.setValue(0)
+        self.crop_bottom.setValue(0)
+        self.crop_left.setValue(0)
+        self.crop_right.setValue(0)
+        
+        # Open file dialog to select the input video file
+        file_name, _ = QFileDialog.getOpenFileName(
+            self, "Select Video File", "", 
+            f"Video Files (*{' *'.join(self.SUPPORTED_VIDEO_FORMATS)});;All Files (*)")
+            
+        if not file_name:
+            return
+
+        # Update input file for preview
+        self.input_files[0]['path'] = file_name
+        
+        # Update the crop preview manager
+        self.preview_manager.set_input_file(self.input_files[0])
+        
+        # Start the animated preview (stopping any previous preview)
+        self.preview_manager.start_preview(fps=10, max_duration=5.0, loop=True)
+        
+        # Show informative message
+        self.log("Select the crop area in the preview window, then press OK.")
+    
+    def _clear_preview_area(self):
+        """Remove all widgets from the preview area, leaving it blank."""
+        if hasattr(self, 'preview_layout') and self.preview_layout is not None:
+            for i in reversed(range(self.preview_layout.count())):
+                item = self.preview_layout.itemAt(i)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
+                else:
+                    self.preview_layout.removeItem(item)
+
+    def update_preview(self, video_path: str):
+        """Update the preview thumbnails for the selected video."""
+        # Always clear existing previews first so blank state is shown if no valid video
+        self._clear_preview_area()
+
+        if not video_path or not os.path.exists(video_path):
+            return
+        
+        # Collect current output settings
+        output_settings = {
+            'resolution': self.resolution.currentText(),
+            'deinterlace': self.deinterlace_checkbox.isChecked() or (
+                self.deinterlace_auto_checkbox.isChecked() and 
+                hasattr(self, '_input_duration') and self._input_duration >0
+            ),
+            'crop_filter': self.cropping_manager.get_crop_filter(self.cropping_widget.get_crop_settings()),
+            'scale_filter': self.scaling_manager.get_scaling_filter(self.scaling_widget.get_scaling_settings())
+            # Add more settings as needed
+        }
+        
+        # Generate new previews
+        preview_widgets = self.preview_manager.generate_preview(
+            video_path, 
+            thumbnail_count=1, 
+            thumbnail_size=(320, 240),  # Smaller preview size
+            output_settings=output_settings
+        )
+        
+        # Add new preview widgets
+        for widget in preview_widgets:
+            self.preview_layout.addWidget(widget)
+
+    def setup_menu(self):
+        """Set up the menu bar"""
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu("&File")
+        
+        open_action = QAction("&Open...", self)
+        open_action.triggered.connect(self.select_input_files)
+        file_menu.addAction(open_action)
+        
+        import_action = QAction("&Import from Disc/ISO...", self)
+        import_action.triggered.connect(lambda: self.tabs.setCurrentWidget(self.import_tab))
+        file_menu.addAction(import_action)
+        
+        file_menu.addSeparator()
+
+        save_preset_action = QAction("&Save Preset...", self)
+        save_preset_action.triggered.connect(self.save_preset)
+        file_menu.addAction(save_preset_action)
+        
+        load_preset_action = QAction("&Load Preset...", self)
+        load_preset_action.triggered.connect(self.load_preset)
+        file_menu.addAction(load_preset_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction("E&xit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # Help menu
+        help_menu = menubar.addMenu("&Help")
+        
+        about_action = QAction("&About", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+        # View/Theme menu
+        try:
+            self._build_theme_menu(menubar)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        """Handle window close event - ensure any active conversion is stopped gracefully"""
+        try:
+            if hasattr(self, 'conversion_thread') and self.conversion_thread.isRunning():
+                self.log("Graceful shutdown: stopping active conversion...")
+                self.conversion_thread.stop()
+                self.conversion_thread.wait(3000)
+        except Exception:
+            pass
+        
+        # Stop any ongoing preview generation
+        if hasattr(self, 'preview_manager'):
+            self.preview_manager.stop_preview()
+        
+        # Stop any ongoing cropping detection
+        if hasattr(self, 'cropping_manager'):
+            self.cropping_manager.stop_detection()
+        
+        # Stop any ongoing scaling detection
+        if hasattr(self, 'scaling_manager'):
+            self.scaling_manager.stop_detection()
+        
+        # Stop any ongoing audio analysis
+        if hasattr(self, 'cropping_manager'):
+            if self._audio_analysis_worker:
+                self._audio_analysis_worker.stop()
+
+        # Clean up import tab worker
+        if hasattr(self, 'import_tab'):
+            self.import_tab.closeEvent(None) # Trigger its cleanup
+        
+        event.accept()
+    
+    def add_input_files(self, file_paths):
+        """Adds files to the input list, avoiding duplicates."""
+        added_files = False
+        for file_path in file_paths:
+            if not any(f['path'] == file_path for f in self.input_files):
+                self.input_files.append({'path': file_path, 'settings': {}})
+                item = QListWidgetItem(os.path.basename(file_path))
+                self.input_files_list_widget.addItem(item)
+                # Update display for the new item
+                self.update_list_item_display(len(self.input_files) - 1)
+                added_files = True
+        
+        if added_files and len(self.input_files) == len(file_paths):
+            # If this is the first batch of files, probe the first one
+            self._load_input_file(self.input_files[0]['path'])
+    def remove_selected_files(self):
+        """Removes selected files from the input list."""
+        selected_items = self.input_files_list_widget.selectedItems()
+        if not selected_items:
+            return
+
+        # Stop any active probing before modifying the list
+        if self._probe_worker and self._probe_thread:
+            self._probe_worker.stop()
+            self._probe_thread.quit()
+            self._probe_thread.wait()
+
+        # Get a list of rows to remove, in descending order to avoid index shifting
+        rows_to_remove = sorted([self.input_files_list_widget.row(item) for item in selected_items], reverse=True)
+
+        for row in rows_to_remove:
+            self.input_files_list_widget.takeItem(row)
+            file_to_remove = self.input_files.pop(row)
+            self.log(f"Removed {os.path.basename(file_to_remove['path'])} from queue.")
+
+        # If the list is now empty, clear info
+        if not self.input_files:
+            self.clear_input_files()
+        else:
+            # Select the new top item if the previous top one was removed
+            if 0 in rows_to_remove:
+                self.input_files_list_widget.setCurrentRow(0)
+                self._load_input_file(self.input_files[0]['path'])
+            # Otherwise, just ensure a valid selection if needed, but don't reload
+            elif self.input_files_list_widget.currentRow() == -1 and len(self.input_files) > 0:
+                self.input_files_list_widget.setCurrentRow(0)
+
+
+    def clear_input_files(self):
+        """Clears the entire input file list."""
+        self.input_files.clear()
+        self.input_files_list_widget.clear()
+        self.duration_label.setText("Duration: N/A")
+        self.size_label.setText("File Size: N/A")
+        self.bitrate_label.setText("Bitrate: N/A")
+        self.resolution_label.setText("Resolution: N/A")
+        self.codec_label.setText("Video Codec: N/A")
+        # Clear preview area to blank state when no files
+        try:
+            self._clear_preview_area()
+        except Exception:
+            pass
+        self.log("Input file queue cleared.")
+    
+    def _load_input_file(self, file_name: str):
+        """Common path to apply a newly chosen input file (from dialog or drag-drop). Starts background probe so all tabs update."""
+        if not file_name:
+            return
+
+        # If a previous probe is running, stop and clean it up
+        if self._probe_worker and self._probe_thread:
+            try:
+                self._probe_worker.stop()
+            except Exception:
+                pass
+            try:
+                self._probe_thread.quit()
+                self._probe_thread.wait(1000)
+            except Exception:
+                pass
+            self._probe_worker = None
+            self._probe_thread = None
+
+        # Update basic UI immediately for the first file
+        if not self.output_dir:
+            self.output_dir = os.path.dirname(file_name)
+            self.output_dir_label.setText(self.output_dir)
+        
+        # Update preview right away with the first file
+        self.update_preview(file_name)
+
+        # Clear prior UI fields while probing
+        self.duration_label.setText("Duration: probing...")
+        self.size_label.setText("File Size: probing...")
+        self.bitrate_label.setText("Bitrate: probing...")
+        self.resolution_label.setText("Resolution: probing...")
+        self.codec_label.setText("Video Codec: probing...")
+
+        # Start probe worker in background thread
+        self._probe_thread = QThread()
+        self._probe_worker = InputProbeWorker()
+        # move worker to thread
+        self._probe_worker.moveToThread(self._probe_thread)
+        # wire signals
+        self._probe_worker.probed.connect(self._on_probe_probed)
+        self._probe_worker.error.connect(self._on_probe_error)
+        self._probe_worker.log.connect(self.log)
+        self._probe_worker.finished.connect(self._cleanup_probe_worker)
+        # start run when thread starts
+        self._probe_thread.started.connect(lambda: self._probe_worker.start_probe.emit(file_name))
+        self._probe_thread.start()
+
+    def select_input_files(self):
+        """Open a file dialog to select input video files."""
+        file_names, _ = QFileDialog.getOpenFileNames(
+            self, "Select Video Files", "", 
+            f"Video Files (*{' *'.join(self.SUPPORTED_VIDEO_FORMATS)});;All Files (*)")
+            
+        if file_names:
+            self.add_input_files(file_names)
+
+    def _on_probe_probed(self, result: dict):
+        """Handle successful probe results emitted from InputProbeWorker."""
+        try:
+            # duration
+            duration = result.get('duration',0.0)
+            if duration and duration >0:
+                minutes = int(duration //60)
+                seconds = int(round(duration %60))
+                self.duration_label.setText(f"Duration: {minutes:02d}:{seconds:02d}")
+            else:
+                self.duration_label.setText("Duration: N/A")
+            self._input_duration = duration
+
+            # size
+            size_bytes = result.get('size_bytes',0)
+            self.size_label.setText(f"File Size: {size_bytes / (1024 *1024):.2f} MB")
+
+            # bitrate
+            if duration and duration >0:
+                bitrate_kbps = round((size_bytes *8) / duration /1000)
+                self.bitrate_label.setText(f"Bitrate: {bitrate_kbps} kbps")
+            else:
+                self.bitrate_label.setText("Bitrate: N/A")
+
+            # resolution & codec
+            resolution = result.get('resolution', 'N/A')
+            codec = result.get('codec', 'N/A')
+            self.resolution_label.setText(f"Resolution: {resolution}")
+            self.codec_label.setText(f"Video Codec: {codec}")
+
+            # Update cropping widget with resolution
+            if resolution != 'N/A':
+                try:
+                    w, h = map(int, resolution.split('x'))
+                    self._input_resolution = (w, h)
+                    self.cropping_widget.update_video_resolution(w, h)
+                    self.log(f"Cropping widget updated with resolution {w}x{h}")
+                    if self.cropping_widget.crop_mode.currentText() == "Automatic":
+                        self.log("Starting automatic crop detection")
+                        # apply scaling pre-filter if any and run crop detection on scaled frames
+                        try:
+                            pre_filter = self.scaling_manager.get_scaling_filter(self.scaling_widget.get_scaling_settings())
+                        except Exception:
+                            pre_filter = None
+                        self.cropping_manager.detect_crop(self.input_files[0]['path'], pre_filter=pre_filter)
+                    else:
+                        self.log(f"Crop mode is {self.cropping_widget.crop_mode.currentText()}, not starting detection")
+                except Exception as e:
+                    self.log(f"Error updating cropping resolution: {e}")
+            else:
+                self.log("Resolution is N/A, not updating cropping")
+
+            # Update scaling widget with resolution
+            if resolution != 'N/A':
+                try:
+                    w, h = map(int, resolution.split('x'))
+                    self.scaling_widget.update_video_resolution(w, h)
+                    self.log(f"Scaling widget updated with resolution {w}x{h}")
+                except Exception as e:
+                    self.log(f"Error updating scaling resolution: {e}")
+
+            # attached pics
+            attached = result.get('attached_pics', []) or []
+            self._input_attached_pics = attached
+            if attached:
+                self.log(f"Input cover art streams detected (global stream indexes): {attached}")
+            else:
+                self.log("Input cover art streams detected: none")
+
+            # field_order hint
+            fo = result.get('field_order')
+            if fo:
+                hint = 'interlaced' if fo not in ['progressive','unknown'] else 'progressive'
+                self.log(f"ffprobe field_order: {fo} (hint: {hint})")
+
+            # subtitles (checkboxes removed; rows selectable)
+            subtitle_display = result.get('subtitle_display') or []
+            subtitle_meta = result.get('subtitle_meta') or []
+            self._subtitle_meta = subtitle_meta
+            self.subtitle_streams_list.clear()
+            self._subtitle_method_widgets = {}
+            if subtitle_display:
+                for i, s_text in enumerate(subtitle_display):
+                    item = QListWidgetItem()
+                    # Only enabled, not selectable or checkable
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    # Do NOT set checkState or ItemIsUserCheckable
+                    try:
+                        item.setSizeHint(QSize(item.sizeHint().width(),28))
+                    except Exception:
+                        pass
+                    if i < len(subtitle_meta):
+                        item.setData(Qt.ItemDataRole.UserRole, subtitle_meta[i]['original_index'])
+                        self.subtitle_streams_list.addItem(item)
+                        
+                        # Build a row widget with label + method combo
+                        row_widget = QWidget()
+                        row_layout = QHBoxLayout(row_widget)
+                        row_layout.setContentsMargins(6,0,6,0)
+                        
+                        # Checkbox for selection
+                        chk = QCheckBox(s_text)
+                        chk.setToolTip("Include this subtitle stream")
+                        
+                        method_cb = QComboBox()
+                        method_cb.addItems(["Copy", "Burn-in", "Convert to SRT"])
+                        method_cb.setCurrentText("Copy")
+                        
+                        row_layout.addWidget(chk, 1)
+                        row_layout.addWidget(QLabel("Method:"))
+                        row_layout.addWidget(method_cb)
+                        
+                        # Use a lambda to connect the checkbox state to the item's check state
+                        chk.stateChanged.connect(lambda state, item=item: item.setData(Qt.ItemDataRole.UserRole +1, state >0))
+
+                        self.subtitle_streams_list.setItemWidget(item, row_widget)
+                        
+                        # Store combo by original index for later retrieval
+                        orig_idx = item.data(Qt.ItemDataRole.UserRole)
+                        if orig_idx is not None:
+                            self._subtitle_method_widgets[orig_idx] = method_cb
+            else:
+                item = QListWidgetItem("No subtitles detected")
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.subtitle_streams_list.addItem(item)
+
+            # audio tracks
+            audio_meta = result.get('audio_meta') or []
+            self._audio_meta = audio_meta
+            self.audio_settings_widget.populate_audio_tracks(audio_meta)
+
+            # Clear previous audio analysis results
+            self._clear_audio_analysis_results()
+
+        except Exception as e:
+            self.log(f"Error applying probe results: {e}")
+
+    def _on_probe_error(self, msg: str):
+        self.log(f"Probe error: {msg}")
+        QMessageBox.warning(self, "Probe Error", f"Failed to probe input file:\n{msg}")
+
+    def _cleanup_probe_worker(self):
+        try:
+            if self._probe_thread:
+                try:
+                    self._probe_thread.quit()
+                except Exception:
+                    pass
+                try:
+                    self._probe_thread.wait(1000)
+                except Exception:
+                    pass
+        finally:
+            self._probe_worker = None
+            self._probe_thread = None
+
+    class _AudioAnalysisDialog(QDialog):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Analyzing Audio")
+            self.setModal(True)
+            self.setFixedSize(380,140)
+            layout = QVBoxLayout(self)
+            self.label = QLabel("Analyzing audio... This may take a while.")
+            layout.addWidget(self.label)
+            self.progress = QProgressBar()
+            self.progress.setRange(0,100)
+            self.progress.setValue(0)
+            layout.addWidget(self.progress)
+            btn_row = QHBoxLayout()
+            self.stop_btn = QPushButton("Stop")
+            btn_row.addStretch(1)
+            btn_row.addWidget(self.stop_btn)
+            layout.addLayout(btn_row)
+
+        def start_audio_analysis(self):
+            """Starts the audio analysis worker in a background thread with a modal dialog to show progress and allow cancel."""
+            if not self.input_files:
+                QMessageBox.warning(self, "No Input File", "Please add an input file to analyze.")
+                return
+            
+            file_path = self.input_files[0]['path']
+
+            if self._audio_analysis_thread and self._audio_analysis_thread.isRunning():
+                self.log("Audio analysis is already running. Please wait.")
+                return
+
+            # Clear previous results
+            self.waveform_label.setText("Analyzing audio...")
+            self.integrated_loudness_label.setText("Integrated Loudness: Analyzing...")
+            self.loudness_range_label.setText("Loudness Range: Analyzing...")
+            self.true_peak_label.setText("True Peak: Analyzing...")
+
+            # Create and show modal progress dialog
+            self._audio_dialog = MainWindow._AudioAnalysisDialog(self)
+            self._audio_dialog.stop_btn.clicked.connect(self._on_cancel_audio_analysis)
+            self._audio_dialog.show()
+
+            self._audio_analysis_thread = QThread()
+            self._audio_analysis_worker = AudioAnalysisWorker(file_path)
+            self._audio_analysis_worker.moveToThread(self._audio_analysis_thread)
+
+            # Wire signals
+            self._audio_analysis_worker.finished.connect(self._on_audio_analysis_finished)
+            self._audio_analysis_worker.error.connect(self._on_audio_analysis_error)
+            self._audio_analysis_worker.log.connect(self.log)
+            # Progress
+            try:
+                self._audio_analysis_worker.progress.connect(self._on_audio_analysis_progress)
+            except Exception:
+                pass
+            self._audio_analysis_thread.started.connect(self._audio_analysis_worker.run)
+            self._audio_analysis_thread.finished.connect(self._cleanup_audio_analysis_worker)
+
+            self._audio_analysis_thread.start()
+
+        def _on_audio_analysis_progress(self, percent: int):
+            if hasattr(self, '_audio_dialog') and self._audio_dialog:
+                self._audio_dialog.progress.setValue(int(percent))
+
+        def _on_cancel_audio_analysis(self):
+            if self._audio_analysis_worker:
+                try:
+                    self._audio_analysis_worker.stop()
+                except Exception:
+                    pass
+            # Update dialog UI to indicate stopping
+            if hasattr(self, '_audio_dialog') and self._audio_dialog:
+                self._audio_dialog.label.setText("Stopping...")
+                self._audio_dialog.stop_btn.setEnabled(False)
+
+        def _on_audio_analysis_finished(self, result: dict):
+            """Handles the successful completion of the audio analysis."""
+            # Close progress dialog if open
+            if hasattr(self, '_audio_dialog') and self._audio_dialog:
+                try:
+                    self._audio_dialog.close()
+                except Exception:
+                    pass
+                self._audio_dialog = None
+
+            # Display waveform
+            waveform_path = result.get('waveform_path')
+            if waveform_path and os.path.exists(waveform_path):
+                pixmap = QPixmap(waveform_path)
+                self.waveform_label.setPixmap(pixmap.scaled(self.waveform_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            else:
+                self.waveform_label.setText("Waveform not available.")
+
+            # Display EBU R128 stats
+            stats = result.get('ebur128_stats', {})
+            self.integrated_loudness_label.setText(f"Integrated Loudness: {stats.get('integrated_loudness', 'N/A')}")
+            self.loudness_range_label.setText(f"Loudness Range: {stats.get('loudness_range', 'N/A')}")
+            self.true_peak_label.setText(f"True Peak: {stats.get('true_peak', 'N/A')}")
+
+        def _on_audio_analysis_error(self, msg: str):
+            """Handles errors from the audio analysis worker."""
+            # Close progress dialog if open
+            if hasattr(self, '_audio_dialog') and self._audio_dialog:
+                try:
+                    self._audio_dialog.close()
+                except Exception:
+                    pass
+                self._audio_dialog = None
+
+            self.waveform_label.setText("Audio analysis failed.")
+            self.log(f"Audio Analysis Error: {msg}")
+
+    def start_audio_analysis(self):
+        """Starts the audio analysis worker in a background thread."""
+        if not self.input_files:
+            QMessageBox.warning(self, "No Input File", "Please add an input file to analyze.")
+            return
+        
+        file_path = self.input_files[0]['path']
+
+        if self._audio_analysis_thread and self._audio_analysis_thread.isRunning():
+            self.log("Audio analysis is already running. Please wait.")
+            return
+
+        # Clear previous results
+        self.waveform_label.setText("Analyzing audio...")
+        self.integrated_loudness_label.setText("Integrated Loudness: Analyzing...")
+        self.loudness_range_label.setText("Loudness Range: Analyzing...")
+        self.true_peak_label.setText("True Peak: Analyzing...")
+
+        # Create and show modal progress dialog
+        self._audio_dialog = MainWindow._AudioAnalysisDialog(self)
+        self._audio_dialog.stop_btn.clicked.connect(self._on_cancel_audio_analysis)
+        self._audio_dialog.show()
+
+        self._audio_analysis_thread = QThread()
+        self._audio_analysis_worker = AudioAnalysisWorker(file_path)
+        self._audio_analysis_worker.moveToThread(self._audio_analysis_thread)
+
+        # Wire signals
+        self._audio_analysis_worker.finished.connect(self._on_audio_analysis_finished)
+        self._audio_analysis_worker.error.connect(self._on_audio_analysis_error)
+        self._audio_analysis_worker.log.connect(self.log)
+        # Progress
+        try:
+            self._audio_analysis_worker.progress.connect(self._on_audio_analysis_progress)
+        except Exception:
+            pass
+        self._audio_analysis_thread.started.connect(self._audio_analysis_worker.run)
+        self._audio_analysis_thread.finished.connect(self._cleanup_audio_analysis_worker)
+
+        self._audio_analysis_thread.start()
+
+    def _on_audio_analysis_progress(self, percent: int):
+        if hasattr(self, '_audio_dialog') and self._audio_dialog:
+            self._audio_dialog.progress.setValue(int(percent))
+
+    def _on_cancel_audio_analysis(self):
+        if self._audio_analysis_worker:
+            try:
+                self._audio_analysis_worker.stop()
+            except Exception:
+                pass
+        # Update dialog UI to indicate stopping
+        if hasattr(self, '_audio_dialog') and self._audio_dialog:
+            self._audio_dialog.label.setText("Stopping...")
+            self._audio_dialog.stop_btn.setEnabled(False)
+
+    def _on_audio_analysis_finished(self, result: dict):
+        """Handles the successful completion of the audio analysis."""
+        # Close progress dialog if open
+        if hasattr(self, '_audio_dialog') and self._audio_dialog:
+            try:
+                self._audio_dialog.close()
+            except Exception:
+                pass
+            self._audio_dialog = None
+
+        # Display waveform
+        waveform_path = result.get('waveform_path')
+        if waveform_path and os.path.exists(waveform_path):
+            pixmap = QPixmap(waveform_path)
+            self.waveform_label.setPixmap(pixmap.scaled(self.waveform_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.waveform_label.setText("Waveform not available.")
+
+        # Display EBU R128 stats
+        stats = result.get('ebur128_stats', {})
+        self.integrated_loudness_label.setText(f"Integrated Loudness: {stats.get('integrated_loudness', 'N/A')}")
+        self.loudness_range_label.setText(f"Loudness Range: {stats.get('loudness_range', 'N/A')}")
+        self.true_peak_label.setText(f"True Peak: {stats.get('true_peak', 'N/A')}")
+
+    def _on_audio_analysis_error(self, msg: str):
+        """Handles errors from the audio analysis worker."""
+        # Close progress dialog if open
+        if hasattr(self, '_audio_dialog') and self._audio_dialog:
+            try:
+                self._audio_dialog.close()
+            except Exception:
+                pass
+            self._audio_dialog = None
+
+        self.waveform_label.setText("Audio analysis failed.")
+        self.log(f"Audio Analysis Error: {msg}")
+
+    def _cleanup_audio_analysis_worker(self):
+        """Cleans up the audio analysis worker and thread."""
+        try:
+            if self._audio_analysis_thread:
+                self._audio_analysis_thread.quit()
+                self._audio_analysis_thread.wait(1000)
+        except Exception:
+            pass
+        finally:
+            self._audio_analysis_worker = None
+            self._audio_analysis_thread = None
+
+    def _clear_audio_analysis_results(self):
+        """Clears the UI fields in the audio analysis tab."""
+        self.waveform_label.setText("No audio analyzed. Press 'Analyze Audio' to begin.")
+        self.integrated_loudness_label.setText("Integrated Loudness: N/A")
+        self.loudness_range_label.setText("Loudness Range: N/A")
+        self.true_peak_label.setText("True Peak: N/A")
+
+    def select_output_directory(self):
+        """Open a directory dialog to select the output directory."""
+        directory = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+        if directory:
+            self.output_dir = directory
+            self.output_dir_label.setText(directory)
+            self.log(f"Output directory set to: {directory}")
+
+    def save_preset(self):
+        """Save current settings as a preset"""
+        # TODO: Implement preset saving
+        QMessageBox.information(self, "Save Preset", "Preset saving will be implemented in a future version.")
+    
+    def load_preset(self):
+        """Load settings from a preset"""
+        # TODO: Implement preset loading
+        QMessageBox.information(self, "Load Preset", "Preset loading will be implemented in a future version.")
+    
+    def show_about(self):
+        """Show about dialog"""
+        QMessageBox.about(self, "About Vion Pulse Video Converter",
+                         "<h2>Vion Pulse Video Converter</h2>"
+                         "<p>An advanced video transcoding application built with Python and FFmpeg.</p>"
+                         "<p>Version 1.0.0</p>"
+                         "<p>©2025 NGNT Creations</p>")
+    
+    def get_available_hw_accels(self):
+        return hw_get_available_hw_accels()
+
+    def get_ffmpeg_hw_accel_args(self, hw_accel_name):
+        return hw_get_ffmpeg_hw_accel_args(hw_accel_name, self.video_codec.currentText(), self.preset.currentText())
+
+    def build_ffmpeg_command_for_file(self, input_file, output_file, settings_override=None, pass_num: int =0):
+        """Builds FFmpeg command for a single file, used by the batch manager."""
+        # Temporarily apply settings_override if provided
+        original_settings = None
+        if settings_override:
+            original_settings = self.collect_current_settings()
+            self.load_settings_from_dict(settings_override)
+
+        # Temporarily set fields used by the builder
+        original_input = self.input_files[0]['path'] if self.input_files else ""
+        self.input_file = input_file
+        self.output_file = output_file
+
+        # Build command, forwarding pass_num for two-pass
+        cmd = self.build_ffmpeg_command(pass_num=pass_num)
+
+        # Restore original state
+        self.input_file = original_input
+        if original_settings:
+            self.load_settings_from_dict(original_settings)
+
+        return cmd
+
+    def build_ffmpeg_command(self, pass_num: int = 0):
+        """Build FFmpeg command from a clean model based on current UI state.
+        Returns list[str] or raises Exception on validation issues.
+        pass_num: forwarded to the underlying builder for two-pass handling.
+        """
+        crop_filter = self.cropping_manager.get_crop_filter(self.cropping_widget.get_crop_settings())
+        scale_filter = self.scaling_manager.get_scaling_filter(self.scaling_widget.get_scaling_settings())
+        audio_settings = self.audio_settings_widget.get_audio_settings()
+        # Collect per-subtitle plan for checked items
+        subtitle_plan = []
+        try:
+            for i in range(self.subtitle_streams_list.count()):
+                item = self.subtitle_streams_list.item(i)
+                # Use the checkbox state stored in UserRole+1
+                checked = item.data(Qt.ItemDataRole.UserRole +1)
+                if not checked:
+                    continue
+                original_index = item.data(Qt.ItemDataRole.UserRole)
+                if original_index is None:
+                    continue
+                method_cb = self._subtitle_method_widgets.get(original_index)
+                method = method_cb.currentText() if method_cb else "Copy"
+                subtitle_plan.append({'original_index': original_index, 'method': method})
+        except Exception:
+            pass
+        
+        # This is a bit of a hack; a better design would be to pass all dependencies to build_ffmpeg_command
+        current_input_file = self.input_file or (self.input_files[0] if self.input_files else "")
+        current_output_file = self.output_file or self.get_output_path_for_file(current_input_file)
+
+        return build_ffmpeg_command(
+            current_input_file,
+            current_output_file,
+            self.format_combo.currentText(),
+            self.video_codec.currentText(),
+            self.preset.currentText(),
+            self.quality_mode.currentText(),
+            self.crf.value(),
+            self.adv_bitrate.value(),
+            self.framerate_mode.currentText(),
+            self.framerate.currentText(),
+            self.hw_accel_combo.currentText(),
+            self.hw_decode_checkbox.isChecked(),
+            self.hw_scale_checkbox.isChecked(),
+            self.preserve_cover_art_checkbox.isChecked(),
+            audio_settings['track_selection'],
+            subtitle_plan,
+            self._subtitle_meta,
+            self._audio_meta,
+            self.threads.value(),
+            self.extra_params.text(),
+            self.log,
+            self.probe_attached_pictures,
+            self.get_ffmpeg_hw_accel_args,
+            self.escape_path_for_subtitles_filter,
+            self.resolution.currentText(),
+            self.deinterlace_checkbox.isChecked(),
+            self.deinterlace_auto_checkbox.isChecked(),
+            self.detect_interlacing,
+            audio_settings['codec'],
+            self.vbr_target.value(),
+            self.vbr_max.value(),
+            self.vbr_min.value(),
+            crop_filter,
+            scale_filter,
+            volume=audio_settings['volume'],
+            normalize=audio_settings['normalize'],
+            normalize_ebu=self.normalize_ebu_checkbox.isChecked(),
+            ebu_target_loudness=self.ebu_target_loudness.value(),
+            pass_num=pass_num
+        )
+
+        # --- Legacy conversion methods ---
+    def start_conversion(self):
+        """Start the video conversion process"""
+        if self.batch_manager.is_running():
+            self.log("Batch conversion is already running.")
+            return
+
+        if not self.input_files:
+            QMessageBox.warning(self, "No Input Files", "Please add files to the input queue.")
+            return
+        if not self.output_dir:
+            QMessageBox.warning(self, "No Output Directory", "Please select an output directory.")
+            return
+
+        try:
+            # Check ffmpeg availability early
+            try:
+                subprocess.run(['ffmpeg','-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+            except FileNotFoundError:
+                QMessageBox.critical(self, "FFmpeg Not Found", "FFmpeg is not installed or not in PATH.")
+                return
+
+            # Ensure output directory writable
+            if not os.access(self.output_dir, os.W_OK):
+                QMessageBox.critical(self, "Permission Denied", f"Cannot write to: {self.output_dir}")
+                return
+
+            # Apply container validation + warnings before building command
+            self.adjust_and_warn_container_codec()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error Preparing Conversion", f"Failed to prepare conversion:\n{e}")
+            self.log(f"Error preparing conversion: {e}")
+            return
+
+        self.start_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        
+        self.batch_manager.set_queue(self.input_files)  # Now list of dicts
+        self.batch_manager.set_output_directory(self.output_dir)
+        self.batch_manager.set_command_builder(self.build_ffmpeg_command_for_file)
+        self.batch_manager.set_duration_getter(self.get_video_duration)
+        self.batch_manager.set_output_format_getter(lambda: self.format_combo.currentText())
+        self.batch_manager.set_preserve_cover_art_getter(lambda: self.preserve_cover_art_checkbox.isChecked())
+        self.batch_manager.set_two_pass_getter(lambda: self.two_pass_checkbox.isChecked())
+        self.batch_manager.start_batch()
+
+    def batch_finished(self, message):
+        """Handle batch completion."""
+        self.start_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.batch_progress_label.setText("Idle")
+        self.time_remaining_label.setText("")
+        QMessageBox.information(self, "Batch Complete", message)
+        self.log(message)
+
+    def update_batch_progress_display(self, current, total, filename):
+        """Updates the label showing batch progress."""
+        self.batch_progress_label.setText(f"Converting file {current} of {total}: {filename}")
+
+    def update_time_remaining_display(self, time_str: str):
+        """Updates the time remaining label."""
+        self.time_remaining_label.setText(time_str)
+
+    def conversion_finished(self, success, error_msg):
+        """Handle conversion completion"""
+        # This method is now largely handled by the BatchConversionManager
+        pass
+        
+    def _on_postprocessed(self, success, log_text, attached_pics):
+        self._input_attached_pics = attached_pics
+        self.log(log_text)
+        QMessageBox.information(self, "Success",
+            f"Video conversion completed successfully!\n\n"
+            f"Output file: {self.output_file}\n"
+            f"Size: {os.path.getsize(self.output_file) / (1024*1024):.2f} MB")
+
+    def _on_postprocess_error(self, msg):
+        self.log(f"Post-process error: {msg}")
+        QMessageBox.warning(self, "Post-Process Error", msg)
+
+    def _cleanup_postprocess_worker(self):
+        try:
+            if hasattr(self, '_postprocess_thread') and self._postprocess_thread:
+                self._postprocess_thread.quit()
+                self._postprocess_thread.wait(1000)
+        except Exception:
+            pass
+        self._postprocess_worker = None
+        self._postprocess_thread = None
+
+    def cancel_conversion(self):
+        """Cancel the ongoing conversion"""
+        if self.batch_manager and self.batch_manager.is_running():
+            self.log("Cancel requested; stopping batch conversion...")
+            self.batch_manager.stop_batch()
+            # The batch manager will emit batch_finished when it's fully stopped.
+        elif hasattr(self, 'conversion_thread') and self.conversion_thread and self.conversion_thread.isRunning():
+            # Fallback for old conversion method, just in case
+            self.log("Cancel requested; stopping conversion thread...")
+            self.conversion_thread.stop()
+            self.conversion_thread.wait()
+            self.progress_bar.setValue(0)
+            self.start_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(False)
+            self.log("Conversion canceled.")
+
+    def _on_crop_detected_main(self, crop_data: Dict[str, int]):
+        """Handle crop detection in MainWindow to update preview."""
+        if self.input_files:
+            self.update_preview(self.input_files[0]['path'])
+
+    def _on_scaling_detected_main(self, scaling_data: Dict[str, any]):
+        """Handle scaling detection in MainWindow to update preview."""
+        if self.input_files:
+            self.update_preview(self.input_files[0]['path'])
+    
+    def _on_scaling_settings_changed(self):
+        """Debounce crop detection when scaling changes to avoid repeated thread launches."""
+        # Cancel any pending timer
+        self._crop_debounce_timer.stop()
+        # Start a new timer (e.g.400ms)
+        self._crop_debounce_timer.start(400)
+
+    def _run_debounced_crop_detection(self):
+        """Actually run crop detection after debounce period."""
+        try:
+            if not hasattr(self, '_input_resolution') or not self._input_resolution:
+                return
+            iw, ih = self._input_resolution
+            settings = self.scaling_widget.get_scaling_settings()
+            # Compute predicted scaled size
+            limit_map = {
+                '4K (2160p)':2160,
+                '1440p':1440,
+                '1080p':1080,
+                '720p':720,
+                '480p':480
+            }
+            res_limit = settings.get('resolution_limit', 'Original')
+            if res_limit == 'Custom':
+                sw = settings.get('scaled_width', iw)
+                sh = settings.get('scaled_height', ih)
+            elif res_limit in limit_map:
+                target_h = limit_map[res_limit]
+                if not settings.get('allow_upscaling', False) and ih <= target_h:
+                    sw, sh = iw, ih
+                else:
+                    if ih >0 and target_h:
+                        sw = int(iw * target_h / ih)
+                        sh = target_h
+                    else:
+                        sw, sh = iw, ih
+            else:
+                sw, sh = iw, ih
+            # Update cropping widget resolution so detection bounds are correct
+            try:
+                self.cropping_widget.update_video_resolution(sw, sh)
+            except Exception:
+                pass
+            # If auto mode, re-run crop detection on scaled frames
+            if self.cropping_widget.crop_mode.currentText() == 'Automatic':
+                pre_filter = self.scaling_manager.get_scaling_filter(settings)
+                self.log(f"Re-running crop detection with pre-filter: {pre_filter}")
+                if self.input_files:
+                    self.cropping_manager.detect_crop(self.input_files[0]['path'], pre_filter=pre_filter)
+            # Update preview as well
+            if self.input_files:
+                self.update_preview(self.input_files[0]['path'])
+        except Exception as e:
+            self.log(f"Error applying scaling settings: {e}")
+
+    def dragEnterEvent(self, event):
+        # Accept drag if it contains URLs (files)
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        # Handle dropped files
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        
+        file_paths = [url.toLocalFile() for url in urls if url.isLocalFile()]
+        
+        video_exts = self.SUPPORTED_VIDEO_FORMATS
+        valid_files = [
+            fp for fp in file_paths 
+            if os.path.isfile(fp) and os.path.splitext(fp)[1].lower() in video_exts
+        ]
+        
+        if valid_files:
+            self.add_input_files(valid_files)
+            self.log(f"Added {len(valid_files)} file(s) by drag-and-drop.")
+        else:
+            QMessageBox.warning(self, "Invalid Files", "Please drop one or more supported video files.")
+
+    def _on_input_file_selected(self, row):
+        """Update info panel when a different input file is selected."""
+        if 0 <= row < len(self.input_files):
+            file_dict = self.input_files[row]
+            self._load_input_file(file_dict['path'])
+            # Load per-file settings if any
+            self.load_settings_from_dict(file_dict['settings'])
+        else:
+            # No valid selection, clear preview
+            try:
+                self._clear_preview_area()
+            except Exception:
+                pass
+
+    def _on_import_files_extracted(self, paths: list):
+        """Handle files extracted from the import tab."""
+        self.log(f"Received {len(paths)} files from import tab.")
+        self.add_input_files(paths)
+        
+        # Optionally set output dir if not already set and it was selected in the import tab
+        if not self.output_dir and self.import_tab.dest_label.text() != "No output directory selected.":
+            self.output_dir = self.import_tab.dest_label.text()
+            self.output_dir_label.setText(self.output_dir)
+
+        # Switch to the converter tab
+        self.tabs.setCurrentWidget(self.main_widget)
+
+    def save_settings_for_selected_file(self):
+        """Save the current UI settings to the selected file's settings dict."""
+        if not self.input_files:
+            QMessageBox.warning(self, "No Input File", "Please select an input file first.")
+            return
+        
+        # Get the currently selected file
+        current_row = self.input_files_list_widget.currentRow()
+        if current_row < 0 or current_row >= len(self.input_files):
+            QMessageBox.warning(self, "Invalid Selection", "No valid input file selected.")
+            return
+        
+        # Collect current settings and save to the file's dict
+        settings = self.collect_current_settings()
+        self.input_files[current_row]['settings'] = settings
+        
+        # Update the list item display
+        self.update_list_item_display(current_row)
+        
+        self.log(f"Settings saved for {os.path.basename(self.input_files[current_row]['path'])}")
+        QMessageBox.information(self, "Settings Saved", "Settings have been saved for the selected file.")
+
+    def update_list_item_display(self, row):
+        """Update the display of the list item to show custom settings indicator."""
+        if 0 <= row < len(self.input_files):
+            file_dict = self.input_files[row]
+            base_name = os.path.basename(file_dict['path'])
+            if file_dict['settings']:
+                display_text = f"{base_name} [Custom]"
+            else:
+                display_text = base_name
+            self.input_files_list_widget.item(row).setText(display_text)
+
+    def load_settings_from_dict(self, settings: dict):
+        """Load settings from a dict into the UI, falling back to defaults if not present."""
+        # Video settings
+        self.video_codec.setCurrentText(settings.get('video_codec', self.video_codec.currentText()))
+        self.preset.setCurrentText(settings.get('preset', self.preset.currentText()))
+        self.resolution.setCurrentText(settings.get('resolution', self.resolution.currentText()))
+        self.framerate.setCurrentText(settings.get('framerate', self.framerate.currentText()))
+        self.framerate_mode.setCurrentText(settings.get('framerate_mode', self.framerate_mode.currentText()))
+        self.deinterlace_checkbox.setChecked(settings.get('deinterlace', self.deinterlace_checkbox.isChecked()))
+        self.deinterlace_auto_checkbox.setChecked(settings.get('deinterlace_auto', self.deinterlace_auto_checkbox.isChecked()))
+        
+        # Audio settings (simplified, assuming audio_settings_widget has setters)
+        audio_settings = settings.get('audio_settings', {})
+        self.audio_settings_widget.set_audio_settings(audio_settings)
+        
+        # Advanced settings
+        self.quality_mode.setCurrentText(settings.get('quality_mode', self.quality_mode.currentText()))
+        self.crf.setValue(settings.get('crf', self.crf.value()))
+        self.adv_bitrate.setValue(settings.get('adv_bitrate', self.adv_bitrate.value()))
+        self.vbr_target.setValue(settings.get('vbr_target', self.vbr_target.value()))
+        self.vbr_max.setValue(settings.get('vbr_max', self.vbr_max.value()))
+        self.vbr_min.setValue(settings.get('vbr_min', self.vbr_min.value()))
+        self.threads.setValue(settings.get('threads', self.threads.value()))
+        self.extra_params.setText(settings.get('extra_params', self.extra_params.text()))
+        self.hw_accel_combo.setCurrentText(settings.get('hw_accel', self.hw_accel_combo.currentText()))
+        self.hw_decode_checkbox.setChecked(settings.get('hw_decode', self.hw_decode_checkbox.isChecked()))
+        self.hw_scale_checkbox.setChecked(settings.get('hw_scale', self.hw_scale_checkbox.isChecked()))
+        self.preserve_cover_art_checkbox.setChecked(settings.get('preserve_cover_art', self.preserve_cover_art_checkbox.isChecked()))
+        
+        # Format
+        self.format_combo.setCurrentText(settings.get('format', self.format_combo.currentText()))
+        
+        # Cropping and scaling (assuming widgets have setters)
+        crop_settings = settings.get('crop_settings', {})
+        self.cropping_widget.set_crop_settings(crop_settings)
+        scale_settings = settings.get('scale_settings', {})
+        self.scaling_widget.set_scaling_settings(scale_settings)
+        
+        # Subtitles (more complex, but for now, assume defaults)
+        # TODO: Implement per-file subtitle settings if needed
+
+    def collect_current_settings(self) -> dict:
+        """Collect current UI settings into a dict."""
+        return {
+            'video_codec': self.video_codec.currentText(),
+            'preset': self.preset.currentText(),
+            'resolution': self.resolution.currentText(),
+            'framerate': self.framerate.currentText(),
+            'framerate_mode': self.framerate_mode.currentText(),
+            'deinterlace': self.deinterlace_checkbox.isChecked(),
+            'deinterlace_auto': self.deinterlace_auto_checkbox.isChecked(),
+            'audio_settings': self.audio_settings_widget.get_audio_settings(),
+            'quality_mode': self.quality_mode.currentText(),
+            'crf': self.crf.value(),
+            'adv_bitrate': self.adv_bitrate.value(),
+            'vbr_target': self.vbr_target.value(),
+            'vbr_max': self.vbr_max.value(),
+            'vbr_min': self.vbr_min.value(),
+            'threads': self.threads.value(),
+            'extra_params': self.extra_params.text(),
+            'hw_accel': self.hw_accel_combo.currentText(),
+            'hw_decode': self.hw_decode_checkbox.isChecked(),
+            'hw_scale': self.hw_scale_checkbox.isChecked(),
+            'preserve_cover_art': self.preserve_cover_art_checkbox.isChecked(),
+            'format': self.format_combo.currentText(),
+            'two_pass': self.two_pass_checkbox.isChecked(),
+            'crop_settings': self.cropping_widget.get_crop_settings(),
+            'scale_settings': self.scaling_widget.get_scaling_settings(),
+        }
+
+    # THEME SYSTEM
+    def _init_theme_system(self):
+        """Load base QSS template and define palettes."""
+        # Load base QSS with tokens
+        try:
+            with open("style.qss", "r", encoding="utf-8") as f:
+                self._base_qss = f.read()
+        except Exception:
+            self._base_qss = ""
+        # Define palettes
+        self._themes = {
+            # Twilight (current)
+            "Twilight": {
+                "bg":"#313362","text":"#F1E8FF","accent":"#52FFF5","border":"#E6B35C",
+                "tab_bg":"#3B3B77","tab_selected_bg":"#4C4C8B",
+                "button_bg":"#3B3B77","button_text":"#F1E8FF","button_border":"#E6B35C",
+                "surface_hover":"#444488","surface_alt":"#2B2B66",
+                "input_bg":"#3B3B77","input_text":"#F1E8FF","input_border":"#E6B35C","selection_bg":"#52FFF5","focus_bg":"#444488",
+                "progress_bg":"#2B2B66","chunk_start":"#E6B35C","chunk_mid":"#52FFF5","chunk_end":"#E6B35C",
+                "checkbox_border":"#4a90e2","checkbox_bg":"#ffffff","checkbox_checked_bg":"#4a90e2",
+                "disabled_bg":"#e0e0e0","disabled_text":"#888888","disabled_border":"#c0c0c0",
+                "list_bg":"#3B3B77","list_selected_bg":"#4C4C8B","list_selected_text":"#52FFF5","list_hover_bg":"#444488","list_hover_text":"#F1E8FF",
+                "scroll_bg":"#2B2B66","scroll_handle_bg":"#4C4C8B","scroll_handle_hover":"#52FFF5",
+                "menu_bg":"#e0e0e0","menu_text":"#000000","menu_selected_bg":"#4a90e2","menu_selected_text":"#ffffff",
+                "status_bg":"#e0e0e0","status_text":"#000000","status_border_top":"#4a90e2",
+            },
+            # Nord
+            "Nord": {
+                "bg":"#2E3440","text":"#ECEFF4","accent":"#88C0D0","border":"#81A1C1",
+                "tab_bg":"#3B4252","tab_selected_bg":"#434C5E",
+                "button_bg":"#3B4252","button_text":"#ECEFF4","button_border":"#81A1C1",
+                "surface_hover":"#4C566A","surface_alt":"#2E3440",
+                "input_bg":"#3B4252","input_text":"#ECEFF4","input_border":"#81A1C1","selection_bg":"#88C0D0","focus_bg":"#434C5E",
+                "progress_bg":"#001F27","chunk_start":"#81A1C1","chunk_mid":"#88C0D0","chunk_end":"#81A1C1",
+                "checkbox_border":"#88C0D0","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#88C0D0",
+                "disabled_bg":"#3B4252","disabled_text":"#7E889A","disabled_border":"#4C566A",
+                "list_bg":"#3B4252","list_selected_bg":"#434C5E","list_selected_text":"#88C0D0","list_hover_bg":"#4C566A","list_hover_text":"#ECEFF4",
+                "scroll_bg":"#2E3440","scroll_handle_bg":"#434C5E","scroll_handle_hover":"#88C0D0",
+                "menu_bg":"#FFFFFF","menu_text":"#073642","menu_selected_bg":"#268BD2","menu_selected_text":"#FFFFFF",
+                "status_bg":"#FFFFFF","status_text":"#073642","status_border_top":"#268BD2",
+            },
+            # Dracula
+            "Dracula": {
+                "bg":"#282A36","text":"#F8F8F2","accent":"#BD93F9","border":"#6272A4",
+                "tab_bg":"#343746","tab_selected_bg":"#44475A",
+                "button_bg":"#343746","button_text":"#F8F8F2","button_border":"#6272A4",
+                "surface_hover":"#3F4254","surface_alt":"#21222C",
+                "input_bg":"#343746","input_text":"#F8F8F2","input_border":"#6272A4","selection_bg":"#BD93F9","focus_bg":"#3F4254",
+                "progress_bg":"#21222C","chunk_start":"#6272A4","chunk_mid":"#BD93F9","chunk_end":"#6272A4",
+                "checkbox_border":"#BD93F9","checkbox_bg":"#1E1F29","checkbox_checked_bg":"#BD93F9",
+                "disabled_bg":"#3B4252","disabled_text":"#9E889A","disabled_border":"#4C566A",
+                "list_bg":"#343746","list_selected_bg":"#44475A","list_selected_text":"#BD93F9","list_hover_bg":"#3F4254","list_hover_text":"#F8F8F2",
+                "scroll_bg":"#21222C","scroll_handle_bg":"#44475A","scroll_handle_hover":"#BD93F9",
+                "menu_bg":"#343746","menu_text":"#F8F8F2","menu_selected_bg":"#BD93F9","menu_selected_text":"#282A36",
+                "status_bg":"#343746","status_text":"#F8F8F2","status_border_top":"#BD93F9",
+            },
+            # Solarized Dark
+            "Solarized Dark": {
+                "bg":"#002B36","text":"#EEE8D5","accent":"#268BD2","border":"#B58900",
+                "tab_bg":"#073642","tab_selected_bg":"#586E75",
+                "button_bg":"#073642","button_text":"#EEE8D5","button_border":"#B58900",
+                "surface_hover":"#4C566A","surface_alt":"#002B36",
+                "input_bg":"#073642","input_text":"#EEE8D5","input_border":"#B58900","selection_bg":"#268BD2","focus_bg":"#586E75",
+                "progress_bg":"#EDE9D6","chunk_start":"#B58900","chunk_mid":"#268BD2","chunk_end":"#B58900",
+                "checkbox_border":"#268BD2","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#268BD2",
+                "disabled_bg":"#3B4252","disabled_text":"#7E889A","disabled_border":"#4C566A",
+                "list_bg":"#073642","list_selected_bg":"#586E75","list_selected_text":"#268BD2","list_hover_bg":"#4C566A","list_hover_text":"#EEE8D5",
+                "scroll_bg":"#002B36","scroll_handle_bg":"#586E75","scroll_handle_hover":"#268BD2",
+                "menu_bg":"#FFFFFF","menu_text":"#073642","menu_selected_bg":"#268BD2","menu_selected_text":"#FDF6E3",
+                "status_bg":"#FFFFFF","status_text":"#073642","status_border_top":"#268BD2",
+            },
+            # Solarized Light
+            "Solarized Light": {
+                "bg":"#FDF6E3","text":"#073642","accent":"#268BD2","border":"#B58900",
+                "tab_bg":"#EEE8D5","tab_selected_bg":"#E1DBCB",
+                "button_bg":"#EEE8D5","button_text":"#073642","button_border":"#B58900",
+                "surface_hover":"#E5E7EB","surface_alt":"#D1D5DB",
+                "input_bg":"#EEE8D5","input_text":"#073642","input_border":"#B58900","selection_bg":"#268BD2","focus_bg":"#E6DFC9",
+                "progress_bg":"#F0F1F5","chunk_start":"#B58900","chunk_mid":"#268BD2","chunk_end":"#B58900",
+                "checkbox_border":"#268BD2","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#268BD2",
+                "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#D6CBA5",
+                "list_bg":"#EEE8D5","list_selected_bg":"#DAD2B9","list_selected_text":"#268BD2","list_hover_bg":"#E6DFC9","list_hover_text":"#073642",
+                "scroll_bg":"#FFFFFF","scroll_handle_bg":"#D3CCB8","scroll_handle_hover":"#268BD2",
+                "menu_bg":"#FFFFFF","menu_text":"#073642","menu_selected_bg":"#268BD2","menu_selected_text":"#FDF6E3",
+                "status_bg":"#FFFFFF","status_text":"#073642","status_border_top":"#268BD2",
+            },
+            # Minimal Light
+            "Minimal Light": {
+                "bg":"#FFFFFF","text":"#111827","accent":"#2563EB","border":"#D1D5DB",
+                "tab_bg":"#F3F4F6","tab_selected_bg":"#E5E7EB",
+                "button_bg":"#F3F4F6","button_text":"#111827","button_border":"#D1D5DB",
+                "surface_hover":"#E5E7EB","surface_alt":"#D1D5DB",
+                "input_bg":"#F3F4F6","input_text":"#111827","input_border":"#D1D5DB","selection_bg":"#2563EB","focus_bg":"#E5E7EB",
+                "progress_bg":"#F0F1F5","chunk_start":"#D1D5DB","chunk_mid":"#2563EB","chunk_end":"#D1D5DB",
+                "checkbox_border":"#2563EB","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#2563EB",
+                "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#D6CBA5",
+                "list_bg":"#F3F4F6","list_selected_bg":"#E5E7EB","list_selected_text":"#2563EB","list_hover_bg":"#E6DFC9","list_hover_text":"#111827",
+                "scroll_bg":"#FFFFFF","scroll_handle_bg":"#D1D5DB","scroll_handle_hover":"#2563EB",
+                "menu_bg":"#FFFFFF","menu_text":"#111827","menu_selected_bg":"#2563EB","menu_selected_text":"#FFF7E6",
+                "status_bg":"#FFFFFF","status_text":"#111827","status_border_top":"#2563EB",
+            },
+            # AMOLED Dark
+            "AMOLED Dark": {
+                "bg":"#000000","text":"#E5E7EB","accent":"#10B981","border":"#374151",
+                "tab_bg":"#0A0A0A","tab_selected_bg":"#141414",
+                "button_bg":"#0A0A0A","button_text":"#E5E7EB","button_border":"#374151",
+                "surface_hover":"#141414","surface_alt":"#111827",
+                "input_bg":"#0A0A0A","input_text":"#E5E7EB","input_border":"#374151","selection_bg":"#10B981","focus_bg":"#141414",
+                "progress_bg":"#111827","chunk_start":"#374151","chunk_mid":"#10B981","chunk_end":"#374151",
+                "checkbox_border":"#10B981","checkbox_bg":"#000000","checkbox_checked_bg":"#10B981",
+                "disabled_bg":"#111827","disabled_text":"#6B7280","disabled_border":"#1F2937",
+                "list_bg":"#0A0A0A","list_selected_bg":"#141414","list_selected_text":"#10B981","list_hover_bg":"#101010","list_hover_text":"#E5E7EB",
+                "scroll_bg":"#111827","scroll_handle_bg":"#2A2A2A","scroll_handle_hover":"#10B981",
+                "menu_bg":"#0A0A0A","menu_text":"#E5E7EB","menu_selected_bg":"#10B981","menu_selected_text":"#000000",
+                "status_bg":"#0A0A0A","status_text":"#E5E7EB","status_border_top":"#10B981",
+            },
+            # High Contrast
+            "High Contrast": {
+                "bg":"#000000","text":"#FFFFFF","accent":"#FFFF00","border":"#FFFFFF",
+                "tab_bg":"#1F1F1F","tab_selected_bg":"#2A2A2A",
+                "button_bg":"#1F1F1F","button_text":"#FFFFFF","button_border":"#FFFFFF",
+                "surface_hover":"#2A2A2A","surface_alt":"#141414",
+                "input_bg":"#1F1F1F","input_text":"#FFFFFF","input_border":"#FFFFFF","selection_bg":"#FFFF00","focus_bg":"#333333",
+                "progress_bg":"#141414","chunk_start":"#FFFFFF","chunk_mid":"#FFFF00","chunk_end":"#FFFFFF",
+                "checkbox_border":"#FFFF00","checkbox_bg":"#000000","checkbox_checked_bg":"#FFFF00",
+                "disabled_bg":"#1F1F1F","disabled_text":"#9E9E9E","disabled_border":"#5A5A5A",
+                "list_bg":"#1F1F1F","list_selected_bg":"#2A2A2A","list_selected_text":"#FFFF00","list_hover_bg":"#333333","list_hover_text":"#FFFFFF",
+                "scroll_bg":"#141414","scroll_handle_bg":"#2A2A2A","scroll_handle_hover":"#FFFF00",
+                "menu_bg":"#000000","menu_text":"#FFFFFF","menu_selected_bg":"#FFFF00","menu_selected_text":"#000000",
+                "status_bg":"#000000","status_text":"#FFFFFF","status_border_top":"#FFFF00",
+            },
+            # Neon Miami (vivid contrasting teals and pinks)
+            "Neon Miami": {
+                "bg":"#0B1026","text":"#E8F7FF","accent":"#00F5D4","border":"#FF6EC7",
+                "tab_bg":"#1A1F3B","tab_selected_bg":"#2A2F4F",
+                "button_bg":"#1A1F3B","button_text":"#E8F7FF","button_border":"#FF6EC7",
+                "surface_hover":"#27305A","surface_alt":"#0E1431",
+                "input_bg":"#1A1F3B","input_text":"#E8F7FF","input_border":"#FF6EC7","selection_bg":"#00F5D4","focus_bg":"#27305A",
+                "progress_bg":"#0E1431","chunk_start":"#FF6EC7","chunk_mid":"#00F5D4","chunk_end":"#FF6EC7",
+                "checkbox_border":"#00F5D4","checkbox_bg":"#151A33","checkbox_checked_bg":"#00F5D4",
+                "disabled_bg":"#25143F","disabled_text":"#BFE5C8","disabled_border":"#25463A",
+                "list_bg":"#1A1F3B","list_selected_bg":"#2A2F4F","list_selected_text":"#00F5D4","list_hover_bg":"#23305A","list_hover_text":"#E8F7FF",
+                "scroll_bg":"#0B1A12","scroll_handle_bg":"#2A2F4F","scroll_handle_hover":"#00F5D4",
+                "menu_bg":"#141936","menu_text":"#E8F7FF","menu_selected_bg":"#00F5D4","menu_selected_text":"#1A0933",
+                "status_bg":"#141936","status_text":"#E8F7FF","status_border_top":"#00F5D4",
+            },
+            # Retro Wave (magenta/cyan punch)
+            "Retro Wave": {
+                "bg":"#1A0933","text":"#FDEAFF","accent":"#7DF9FF","border":"#FF6EC7",
+                "tab_bg":"#2A124C","tab_selected_bg":"#3A1D66",
+                "button_bg":"#2A124C","button_text":"#FDEAFF","button_border":"#FF6EC7",
+                "surface_hover":"#3A1D66","surface_alt":"#110524",
+                "input_bg":"#2A124C","input_text":"#FDEAFF","input_border":"#FF6EC7","selection_bg":"#7DF9FF","focus_bg":"#3A1D66",
+                "progress_bg":"#120624","chunk_start":"#FF6EC7","chunk_mid":"#7DF9FF","chunk_end":"#FF6EC7",
+                "checkbox_border":"#7DF9FF","checkbox_bg":"#2A173A","checkbox_checked_bg":"#7DF9FF",
+                "disabled_bg":"#3A1A1A","disabled_text":"#E7DDE4","disabled_border":"#3A1D66",
+                "list_bg":"#2A124C","list_selected_bg":"#3A1D66","list_selected_text":"#7DF9FF","list_hover_bg":"#462A61","list_hover_text":"#FDEAFF",
+                "scroll_bg":"#120624","scroll_handle_bg":"#3A1D66","scroll_handle_hover":"#7DF9FF",
+                "menu_bg":"#2A173A","menu_text":"#FDEAFF","menu_selected_bg":"#7DF9FF","menu_selected_text":"#2A124C",
+                "status_bg":"#2A173A","status_text":"#FDEAFF","status_border_top":"#7DF9FF",
+            },
+            # Sunset Pop (orange/coral vs teal accents)
+            "Sunset Pop": {
+                "bg":"#2A0F0F","text":"#FFF5E6","accent":"#FF8A00","border":"#FF4D6D",
+                "tab_bg":"#3B1717","tab_selected_bg":"#4C1E1E",
+                "button_bg":"#3B1717","button_text":"#FFF5E6","button_border":"#FF4D6D",
+                "surface_hover":"#5A2323","surface_alt":"#1D0A0A",
+                "input_bg":"#3B1717","input_text":"#FFF5E6","input_border":"#FF4D6D","selection_bg":"#FF8A00","focus_bg":"#5A2323",
+                "progress_bg":"#1D0A0A","chunk_start":"#FF4D6D","chunk_mid":"#FF8A00","chunk_end":"#FF4D6D",
+                "checkbox_border":"#FF8A00","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#FF8A00",
+                "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#4C566A",
+                "list_bg":"#3B1717","list_selected_bg":"#4C1E1E","list_selected_text":"#FF8A00","list_hover_bg":"#522222","list_hover_text":"#FFF5E6",
+                "scroll_bg":"#1D0A0A","scroll_handle_bg":"#4C1E1E","scroll_handle_hover":"#FF8A00",
+                "menu_bg":"#2F1212","menu_text":"#FFF5E6","menu_selected_bg":"#FF8A00","menu_selected_text":"#3B1717",
+                "status_bg":"#2F1212","status_text":"#FFF5E6","status_border_top":"#FF8A00",
+            },
+            # Ocean Coral (teal base with coral accent)
+            "Ocean Coral": {
+                "bg":"#0E2630","text":"#E7FBFF","accent":"#FF6B6B","border":"#4ECDC4",
+                "tab_bg":"#163844","tab_selected_bg":"#1E4B57",
+                "button_bg":"#163844","button_text":"#E7FBFF","button_border":"#4ECDC4",
+                "surface_hover":"#225B69","surface_alt":"#0B1A12",
+                "input_bg":"#163844","input_text":"#E7FBFF","input_border":"#4ECDC4","selection_bg":"#FF6B6B","focus_bg":"#225B69",
+                "progress_bg":"#0B1A12","chunk_start":"#4ECDC4","chunk_mid":"#FF6B6B","chunk_end":"#4ECDC4",
+                "checkbox_border":"#FF6B6B","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#FF6B6B",
+                "disabled_bg":"#25143F","disabled_text":"#BFE5C8","disabled_border":"#28515F",
+                "list_bg":"#163844","list_selected_bg":"#1E4B57","list_selected_text":"#FF6B6B","list_hover_bg":"#1B3A2E","list_hover_text":"#E7FBFF",
+                "scroll_bg":"#0B1A12","scroll_handle_bg":"#1E4B57","scroll_handle_hover":"#FF6B6B",
+                "menu_bg":"#13281E","menu_text":"#E7FBFF","menu_selected_bg":"#FF6B6B","menu_selected_text":"#163844",
+                "status_bg":"#13281E","status_text":"#E7FBFF","status_border_top":"#FF6B6B",
+            },
+            # Tropical Punch (green/magenta punchy contrast)
+            "Tropical Punch": {
+                "bg":"#102418","text":"#EBFFEF","accent":"#A7F432","border":"#00C853",
+                "tab_bg":"#163026","tab_selected_bg":"#1D3B31",
+                "button_bg":"#163026","button_text":"#EBFFEF","button_border":"#00C853",
+                "surface_hover":"#214638","surface_alt":"#0B1A12",
+                "input_bg":"#163026","input_text":"#EBFFEF","input_border":"#00C853","selection_bg":"#FF5E99","focus_bg":"#214638",
+                "progress_bg":"#0B1A12","chunk_start":"#00C853","chunk_mid":"#FF5E99","chunk_end":"#00C853",
+                "checkbox_border":"#FF5E99","checkbox_bg":"#3B4252","checkbox_checked_bg":"#FF5E99",
+                "disabled_bg":"#1B3328","disabled_text":"#BFE5C8","disabled_border":"#25463A",
+                "list_bg":"#163026","list_selected_bg":"#1D3B31","list_selected_text":"#A7F432","list_hover_bg":"#1B3A2E","list_hover_text":"#EBFFEF",
+                "scroll_bg":"#0B1A12","scroll_handle_bg":"#1D3B31","scroll_handle_hover":"#A7F432",
+                "menu_bg":"#13281E","menu_text":"#EBFFEF","menu_selected_bg":"#A7F432","menu_selected_text":"#163026",
+                "status_bg":"#13281E","status_text":"#EBFFEF","status_border_top":"#A7F432",
+            },
+            # Candy Pop (purple base, hot pink + cyan accents)
+            "Candy Pop": {
+                "bg":"#24132F","text":"#FFF7FB","accent":"#FF5E99","border":"#7CF0FF",
+                "tab_bg":"#311A40","tab_selected_bg":"#3E2252",
+                "button_bg":"#311A40","button_text":"#FFF7FB","button_border":"#7CF0FF",
+                "surface_hover":"#492C66","surface_alt":"#1A0E24",
+                "input_bg":"#311A40","input_text":"#FFF7FB","input_border":"#7CF0FF","selection_bg":"#FF5E99","focus_bg":"#492C66",
+                "progress_bg":"#1A0E24","chunk_start":"#7CF0FF","chunk_mid":"#FF5E99","chunk_end":"#7CF0FF",
+                "checkbox_border":"#FF5E99","checkbox_bg":"#2A173A","checkbox_checked_bg":"#FF5E99",
+                "disabled_bg":"#3A214D","disabled_text":"#E7DDE4","disabled_border":"#513069",
+                "list_bg":"#311A40","list_selected_bg":"#3E2252","list_selected_text":"#FF5E99","list_hover_bg":"#462A61","list_hover_text":"#FFF7FB",
+                "scroll_bg":"#1A0E24","scroll_handle_bg":"#3E2252","scroll_handle_hover":"#FF5E99",
+                "menu_bg":"#2A173A","menu_text":"#FFF7FB","menu_selected_bg":"#FF5E99","menu_selected_text":"#311A40",
+                "status_bg":"#2A173A","status_text":"#FFF7FB","status_border_top":"#FF5E99",
+            },
+        }
+
+    def apply_theme(self, name: str):
+        """Apply a theme by name by token replacement and persist selection."""
+        if not self._base_qss:
+            return
+        palette = self._themes.get(name)
+        if not palette:
+            return
+        qss = self._base_qss
+        for key, val in palette.items():
+            qss = qss.replace(f"@{key}", val)
+        try:
+            from PyQt6.QtWidgets import QApplication
+            QApplication.instance().setStyleSheet(qss)
+            self._theme_name = name
+            QSettings("NGNT", "VionFlux").setValue("theme", name)
+            # Update menu checks
+            if hasattr(self, "_theme_actions"):
+                for n, act in self._theme_actions.items():
+                    act.setChecked(n == name)
+            # Update logo tint for current theme
+            self._update_logo_tint(palette)
+        except Exception:
+            pass
+
+    def _update_logo_tint(self, palette: dict):
+        """Update QML logo if present, otherwise tint PNG header label with theme colors."""
+        try:
+            accent = QColor(palette.get('accent', '#52FFF5'))
+            border = QColor(palette.get('border', '#E6B35C'))
+            # Update QML logo if used
+            if self.logo_widget and hasattr(self.logo_widget, 'rootObject') and self.logo_widget.rootObject():
+                root = self.logo_widget.rootObject()
+                root.setProperty('sourcePath', QUrl.fromLocalFile(self._logo_path))
+                root.setProperty('color1', accent)
+                root.setProperty('color2', border)
+            # Update QLabel logo by tinting the PNG
+            if hasattr(self, 'logo_label') and self.logo_label is not None:
+                self._set_tinted_logo_pixmap(accent, border)
+        except Exception:
+            pass
+
+    def _set_tinted_logo_pixmap(self, color1: QColor, color2: QColor):
+        """Create a gradient-tinted pixmap from the logo's alpha and set it on the label."""
+        try:
+            base = QPixmap(self._logo_path)
+            if not base or base.isNull():
+                return
+            # Scale to UI height
+            target_pm = base.scaledToHeight(80, Qt.TransformationMode.SmoothTransformation)
+            w = target_pm.width(); h = target_pm.height()
+            # Paint gradient
+            tinted = QPixmap(w, h)
+            tinted.fill(Qt.GlobalColor.transparent)
+            p = QPainter(tinted)
+            grad = QLinearGradient(0,0, w,0)
+            grad.setColorAt(0.0, color1)
+            grad.setColorAt(1.0, color2)
+            p.fillRect(0,0, w, h, grad)
+            # Use original alpha as mask
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            p.drawPixmap(0,0, target_pm)
+            p.end()
+            self.logo_label.setPixmap(tinted)
+        except Exception:
+            pass
+
+    def _build_theme_menu(self, menubar):
+        """Create the View > Theme menu with checkable actions for each theme."""
+        view_menu = menubar.addMenu("&View")
+        theme_menu = view_menu.addMenu("&Theme")
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self._theme_actions = {}
+        for name in self._themes.keys():
+            act = QAction(name, self, checkable=True)
+            # bind name at definition time
+            act.triggered.connect(lambda _checked=False, n=name: self.apply_theme(n))
+            theme_menu.addAction(act)
+            group.addAction(act)
+            self._theme_actions[name] = act
+            # reflect current theme selection if already applied
+            if self._theme_name and self._theme_name in self._theme_actions:
+                self._theme_actions[self._theme_name].setChecked(True)
+        return view_menu
