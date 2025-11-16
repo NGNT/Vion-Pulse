@@ -106,7 +106,7 @@ def build_ffmpeg_command(
     cmd = ['ffmpeg','-y']
     if hw_decode_checkbox_checked and hw_accel_args.get('decode_hwaccel'):
         cmd.extend(['-hwaccel', hw_accel_args['decode_hwaccel']])
-    cmd.extend(['-i', input_file, '-loglevel','warning','-nostats','-progress','pipe:1'])
+    cmd.extend(['-i', input_file, '-loglevel','warning','-nostats'])
 
     # Determine burn-in target (first stream with method Burn-in)
     burn_in_entry = next((e for e in subtitle_plan if e.get('method') == 'Burn-in'), None)
@@ -159,7 +159,7 @@ def build_ffmpeg_command(
                 # Image-based (e.g. pgs, dvd_sub). Use overlay via filter_complex.
                 # Build filter_complex including existing vf_chain applied to video before overlay.
                 base_video_chain = ','.join(vf_chain) if vf_chain else 'null'
-                overlay_filter = f"[0:v]{base_video_CHAIN}[vpre];[vpre][0:s:{meta.get('pos')}]overlay[vout]"
+                overlay_filter = f"[0:v]{base_video_chain}[vpre];[vpre][0:s:{meta.get('pos')}]overlay[vout]"
                 cmd.extend(['-filter_complex', overlay_filter, '-map','[vout]'])
                 vf_chain = [] # Handled in complex chain
                 log_fn(f"Burn-in image subtitles stream pos {meta.get('pos')} (original {orig_idx})")
@@ -174,10 +174,64 @@ def build_ffmpeg_command(
     attached_pic_indices = [i for i,v in enumerate(video_streams) if v.get('attached_pic')]
     if not preserve_cover_art_checkbox_checked:
         attached_pic_indices = []
+
+    # Build ordered -map argument tokens: main video first, then audio, attached pics, then subtitles
+    map_args: List[str] = []
     if has_video and video_map_index is not None:
-        cmd.extend(['-map', f'0:v:{video_map_index}'])
+        map_args.append('-map')
+        map_args.append(f'0:v:{video_map_index}')
+
+    # Audio maps
+    if has_audio and audio_count >0:
+        sel = audio_track_combo_data
+        if sel == 'all':
+            for pos in range(audio_count):
+                map_args.append('-map')
+                map_args.append(f'0:a:{pos}')
+        elif isinstance(sel, int) and 0 <= sel < audio_count:
+            map_args.append('-map')
+            map_args.append(f'0:a:{sel}')
+        else:
+            map_args.append('-map')
+            map_args.append('0:a:0')
+
+    # Attached pictures (cover art)
     for idx in attached_pic_indices:
-        cmd.extend(['-map', f'0:v:{idx}'])
+        map_args.append('-map')
+        map_args.append(f'0:v:{idx}')
+
+    # Non-burnin subtitles
+    subtitle_stream_count = len(subtitle_meta)
+    non_burnin_subtitles = []
+    if subtitle_stream_count >0:
+        non_burnin_subtitles = [entry for entry in subtitle_plan if entry.get('method') != 'Burn-in']
+        for entry in non_burnin_subtitles:
+            orig_idx = entry['original_index']
+            meta = next((m for m in subtitle_meta if m.get('original_index') == orig_idx), None)
+            if not meta:
+                log_fn(f"Subtitle original_index {orig_idx} not found; skipping.")
+                continue
+            pos = meta.get('pos')
+            map_args.append('-map')
+            map_args.append(f'0:s:{pos}')
+
+    # Remove any previous -map tokens from cmd and insert our ordered maps
+    cleaned_cmd: List[str] = []
+    skip_next = False
+    for i, tok in enumerate(cmd):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == '-map':
+            # skip this -map and the following token if present
+            skip_next = True
+            continue
+        # also skip tokens that accidentally merged like '-map0:...'
+        if isinstance(tok, str) and tok.startswith('-map'):
+            continue
+        cleaned_cmd.append(tok)
+    cmd = cleaned_cmd
+    cmd.extend(map_args)
 
     # Video codec (first real video output index is0)
     if has_video and video_map_index is not None:
@@ -210,15 +264,7 @@ def build_ffmpeg_command(
         cmd.extend(['-r', framerate_text])
 
     # Audio mapping
-    if has_audio and audio_count >0:
-        sel = audio_track_combo_data
-        if sel == 'all':
-            for pos in range(audio_count):
-                cmd.extend(['-map', f'0:a:{pos}'])
-        elif isinstance(sel, int) and 0 <= sel < audio_count:
-            cmd.extend(['-map', f'0:a:{sel}'])
-        else:
-            cmd.extend(['-map', '0:a:0'])
+    # Audio mapping is handled earlier when building ordered map_args
 
     # --- Audio Filters ---
     audio_filters = []
@@ -241,7 +287,6 @@ def build_ffmpeg_command(
     subtitle_stream_count = len(subtitle_meta)
     if subtitle_stream_count > 0:
         # Filter out Burn-in method since it's already handled by the video filter logic
-        non_burnin_subtitles = [entry for entry in subtitle_plan if entry.get('method') != 'Burn-in']
         subtitle_output_index = 0 # This tracks the output subtitle stream index
         for entry in non_burnin_subtitles:
             orig_idx = entry['original_index']
@@ -250,13 +295,10 @@ def build_ffmpeg_command(
                 log_fn(f"Subtitle original_index {orig_idx} not found; skipping.")
                 continue
             
-            pos = meta.get('pos')
-            cmd.extend(['-map', f'0:s:{pos}'])
-            
             method = entry.get('method')
             codec_name = (meta.get('codec_name') or '').lower()
 
-            # Handle container compatibility
+            # Handle container compatibility and set codec for the output subtitle index
             if method == 'Copy' and output_ext == 'mp4' and codec_name in ['subrip', 'srt']:
                 log_fn(f"Subtitle stream {orig_idx} is SubRip; converting to mov_text for MP4 container.")
                 cmd.extend([f'-c:s:{subtitle_output_index}', 'mov_text'])
@@ -275,9 +317,11 @@ def build_ffmpeg_command(
     if threads_value and threads_value >0:
         cmd.extend(['-threads', str(threads_value)])
     if extra_params_text.strip():
-        # naive split by space; advanced parsing could be added later
         cmd.extend(extra_params_text.strip().split())
 
+    # Move -progress pipe:1 to the end, just before output file
+    cmd = [x for x in cmd if x != '-progress' and x != 'pipe:1']
+    cmd.extend(['-progress', 'pipe:1'])
     cmd.append(output_file)
     return cmd
 

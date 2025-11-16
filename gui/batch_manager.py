@@ -88,6 +88,7 @@ class BatchConversionManager(QObject):
     def set_two_pass_getter(self, two_pass_fn):
         self._two_pass_fn = two_pass_fn
 
+    @pyqtSlot()
     def start_batch(self):
         if not self._file_queue:
             self.log_message.emit("No files in the queue.")
@@ -153,12 +154,21 @@ class BatchConversionManager(QObject):
                 # --- First Pass ---
                 self.log_message.emit("Pass 1 of 2...")
                 pass1_cmd = self._build_command_fn(input_file, output_file, settings_override, pass_num=1)
-                self.current_process = subprocess.Popen(pass1_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                self.log_message.emit(f"FFmpeg command (pass 1): {' '.join(pass1_cmd)}")
+                try:
+                    self.current_process = subprocess.Popen(pass1_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                except Exception as e:
+                    self.log_message.emit(f"Error launching FFmpeg (pass 1): {e}")
+                    self._fail_count += 1
+                    self._current_file_index += 1
+                    self._start_next_conversion()
+                    return
                 
                 for line in iter(self.current_process.stdout.readline, ''):
                     self.log_message.emit(line.strip())
                 
                 self.current_process.wait()
+                self.log_message.emit(f"FFmpeg exited with code {self.current_process.returncode} (pass 1)")
                 if self.current_process.returncode != 0:
                     raise Exception("Two-pass encoding failed on pass 1.")
                 
@@ -169,11 +179,27 @@ class BatchConversionManager(QObject):
                 # --- Second Pass ---
                 self.log_message.emit("Pass 2 of 2...")
                 pass2_cmd = self._build_command_fn(input_file, output_file, settings_override, pass_num=2)
-                self.current_process = subprocess.Popen(pass2_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                self.log_message.emit(f"FFmpeg command (pass 2): {' '.join(pass2_cmd)}")
+                try:
+                    self.current_process = subprocess.Popen(pass2_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                except Exception as e:
+                    self.log_message.emit(f"Error launching FFmpeg (pass 2): {e}")
+                    self._fail_count += 1
+                    self._current_file_index += 1
+                    self._start_next_conversion()
+                    return
             else:
                 # --- Single-Pass Encoding ---
                 cmd = self._build_command_fn(input_file, output_file, settings_override)
-                self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                self.log_message.emit(f"FFmpeg command: {' '.join(cmd)}")
+                try:
+                    self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                except Exception as e:
+                    self.log_message.emit(f"Error launching FFmpeg: {e}")
+                    self._fail_count += 1
+                    self._current_file_index += 1
+                    self._start_next_conversion()
+                    return
 
             duration = self._get_duration_fn(input_file)
             self.time_manager = TimeRemainingManager(duration)
@@ -199,6 +225,7 @@ class BatchConversionManager(QObject):
                             self.time_remaining_updated.emit(time_str)
 
             self.current_process.wait()
+            self.log_message.emit(f"FFmpeg exited with code {self.current_process.returncode}")
             if self.is_stopping:
                 self.log_message.emit(f"Conversion canceled for: {base_name}")
             else:

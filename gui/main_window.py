@@ -90,6 +90,9 @@ class MainWindow(QMainWindow):
         self.scaling_manager = ScalingManager(log_callback=self.log)
         self.scaling_widget = ScalingWidget()
 
+        # Thread for batch conversion to avoid blocking GUI
+        self.batch_thread = None
+
         # Set up the UI
         self.setup_ui()
         self.setup_menu()
@@ -106,7 +109,7 @@ class MainWindow(QMainWindow):
  
  # Now that UI elements exist, connect signals
         self.batch_manager.log_message.connect(self.log)
-        self.batch_manager.batch_finished.connect(self.batch_finished)
+        self.batch_manager.batch_finished.connect(self._on_batch_finished)
         self.batch_manager.file_progress.connect(self.progress_bar.setValue)
         self.batch_manager.time_remaining_updated.connect(self.update_time_remaining_display)
         self.batch_manager.batch_progress.connect(self.update_batch_progress_display)
@@ -650,16 +653,16 @@ class MainWindow(QMainWindow):
         self.vbr_min_label.setEnabled(vbr_enabled)
         self.vbr_min.setEnabled(vbr_enabled)
 
-        # Two-pass is only relevant for bitrate-based modes
-        self.two_pass_checkbox.setEnabled(avg_bitrate_enabled or vbr_enabled)
+        # Two-pass is only relevant for bitrate-based modes and not supported with hardware acceleration
+        self.two_pass_checkbox.setEnabled((avg_bitrate_enabled or vbr_enabled) and not is_hw_accel)
         if not self.two_pass_checkbox.isEnabled():
             self.two_pass_checkbox.setChecked(False)
-
-        # If HW accel is on, CRF is disabled with a tooltip explaining why
-        if is_hw_accel:
-            self.crf.setToolTip("CRF is not applicable for most hardware encoders. Quality is controlled by the 'Preset' or is implicitly managed.")
+            if is_hw_accel:
+                self.two_pass_checkbox.setToolTip("Two-pass encoding is not supported with hardware acceleration.")
+            else:
+                self.two_pass_checkbox.setToolTip("Improves quality for a target bitrate, but is slower. Only for bitrate-based modes.")
         else:
-            self.crf.setToolTip("")
+            self.two_pass_checkbox.setToolTip("Improves quality for a target bitrate, but is slower. Only for bitrate-based modes.")
 
     def on_estimate_bitrate_clicked(self):
         """Estimate required video bitrate (kbps) to reach target size considering audio bitrate using worker."""
@@ -974,6 +977,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'cropping_manager'):
             if self._audio_analysis_worker:
                 self._audio_analysis_worker.stop()
+
+        # Clean up batch thread
+        if self.batch_thread and self.batch_thread.isRunning():
+            self.batch_manager.stop_batch()
+            self.batch_thread.quit()
+            self.batch_thread.wait(3000)
 
         # Clean up import tab worker
         if hasattr(self, 'import_tab'):
@@ -1654,9 +1663,29 @@ class MainWindow(QMainWindow):
         self.batch_manager.set_output_format_getter(lambda: self.format_combo.currentText())
         self.batch_manager.set_preserve_cover_art_getter(lambda: self.preserve_cover_art_checkbox.isChecked())
         self.batch_manager.set_two_pass_getter(lambda: self.two_pass_checkbox.isChecked())
-        self.batch_manager.start_batch()
+        
+        # Start batch in a separate thread to avoid blocking GUI
+        self.batch_thread = QThread()
+        self.batch_manager.moveToThread(self.batch_thread)
+        self.batch_thread.started.connect(self.batch_manager.start_batch)
+        self.batch_thread.start()
+        
+        # Deprecated direct thread usage
+        """
+        # Start the conversion in a separate thread to avoid blocking the UI
+        self.batch_thread = QThread()
+        self.conversion_thread = ConversionThread(self.input_files, self.output_dir, self.build_ffmpeg_command_for_file)
+        self.conversion_thread.moveToThread(self.batch_thread)
+        self.batch_thread.started.connect(self.conversion_thread.run)
+        self.conversion_thread.finished.connect(self._on_conversion_finished)
+        self.conversion_thread.log.connect(self.log)
+        self.conversion_thread.progress.connect(self.progress_bar.setValue)
+        self.conversion_thread.time_remaining_updated.connect(self.update_time_remaining_display)
+        self.conversion_thread.batch_progress.connect(self.update_batch_progress_display)
+        self.batch_thread.start()
+        """
 
-    def batch_finished(self, message):
+    def _on_batch_finished(self, message):
         """Handle batch completion."""
         self.start_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
@@ -1665,6 +1694,12 @@ class MainWindow(QMainWindow):
         self.time_remaining_label.setText("")
         QMessageBox.information(self, "Batch Complete", message)
         self.log(message)
+        
+        # Clean up the batch thread
+        if self.batch_thread:
+            self.batch_thread.quit()
+            self.batch_thread.wait(1000)
+            self.batch_thread = None
 
     def update_batch_progress_display(self, current, total, filename):
         """Updates the label showing batch progress."""
@@ -1989,7 +2024,7 @@ class MainWindow(QMainWindow):
                 "input_bg":"#343746","input_text":"#F8F8F2","input_border":"#6272A4","selection_bg":"#BD93F9","focus_bg":"#3F4254",
                 "progress_bg":"#21222C","chunk_start":"#6272A4","chunk_mid":"#BD93F9","chunk_end":"#6272A4",
                 "checkbox_border":"#BD93F9","checkbox_bg":"#1E1F29","checkbox_checked_bg":"#BD93F9",
-                "disabled_bg":"#3B4252","disabled_text":"#9E889A","disabled_border":"#4C566A",
+                "disabled_bg":"#3B4252","disabled_text":"#9E9E9E","disabled_border":"#4C566A",
                 "list_bg":"#343746","list_selected_bg":"#44475A","list_selected_text":"#BD93F9","list_hover_bg":"#3F4254","list_hover_text":"#F8F8F2",
                 "scroll_bg":"#21222C","scroll_handle_bg":"#44475A","scroll_handle_hover":"#BD93F9",
                 "menu_bg":"#343746","menu_text":"#F8F8F2","menu_selected_bg":"#BD93F9","menu_selected_text":"#282A36",
@@ -2004,7 +2039,7 @@ class MainWindow(QMainWindow):
                 "input_bg":"#073642","input_text":"#EEE8D5","input_border":"#B58900","selection_bg":"#268BD2","focus_bg":"#586E75",
                 "progress_bg":"#EDE9D6","chunk_start":"#B58900","chunk_mid":"#268BD2","chunk_end":"#B58900",
                 "checkbox_border":"#268BD2","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#268BD2",
-                "disabled_bg":"#3B4252","disabled_text":"#7E889A","disabled_border":"#4C566A",
+                "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#4C566A",
                 "list_bg":"#073642","list_selected_bg":"#586E75","list_selected_text":"#268BD2","list_hover_bg":"#4C566A","list_hover_text":"#EEE8D5",
                 "scroll_bg":"#002B36","scroll_handle_bg":"#586E75","scroll_handle_hover":"#268BD2",
                 "menu_bg":"#FFFFFF","menu_text":"#073642","menu_selected_bg":"#268BD2","menu_selected_text":"#FDF6E3",
@@ -2052,8 +2087,8 @@ class MainWindow(QMainWindow):
                 "disabled_bg":"#111827","disabled_text":"#6B7280","disabled_border":"#1F2937",
                 "list_bg":"#0A0A0A","list_selected_bg":"#141414","list_selected_text":"#10B981","list_hover_bg":"#101010","list_hover_text":"#E5E7EB",
                 "scroll_bg":"#111827","scroll_handle_bg":"#2A2A2A","scroll_handle_hover":"#10B981",
-                "menu_bg":"#0A0A0A","menu_text":"#E5E7EB","menu_selected_bg":"#10B981","menu_selected_text":"#000000",
-                "status_bg":"#0A0A0A","status_text":"#E5E7EB","status_border_top":"#10B981",
+                "menu_bg":"#000000","menu_text":"#E5E7EB","menu_selected_bg":"#10B981","menu_selected_text":"#000000",
+                "status_bg":"#000000","status_text":"#E5E7EB","status_border_top":"#10B981",
             },
             # High Contrast
             "High Contrast": {
@@ -2078,7 +2113,7 @@ class MainWindow(QMainWindow):
                 "surface_hover":"#27305A","surface_alt":"#0E1431",
                 "input_bg":"#1A1F3B","input_text":"#E8F7FF","input_border":"#FF6EC7","selection_bg":"#00F5D4","focus_bg":"#27305A",
                 "progress_bg":"#0E1431","chunk_start":"#FF6EC7","chunk_mid":"#00F5D4","chunk_end":"#FF6EC7",
-                "checkbox_border":"#00F5D4","checkbox_bg":"#151A33","checkbox_checked_bg":"#00F5D4",
+                "checkbox_border":"#FF5E99","checkbox_bg":"#1E1F29","checkbox_checked_bg":"#FF5E99",
                 "disabled_bg":"#25143F","disabled_text":"#BFE5C8","disabled_border":"#25463A",
                 "list_bg":"#1A1F3B","list_selected_bg":"#2A2F4F","list_selected_text":"#00F5D4","list_hover_bg":"#23305A","list_hover_text":"#E8F7FF",
                 "scroll_bg":"#0B1A12","scroll_handle_bg":"#2A2F4F","scroll_handle_hover":"#00F5D4",
@@ -2093,7 +2128,7 @@ class MainWindow(QMainWindow):
                 "surface_hover":"#492C66","surface_alt":"#1A0E24",
                 "input_bg":"#2A124C","input_text":"#FDEAFF","input_border":"#FF6EC7","selection_bg":"#7DF9FF","focus_bg":"#492C66",
                 "progress_bg":"#1A0E24","chunk_start":"#FF6EC7","chunk_mid":"#7DF9FF","chunk_end":"#FF6EC7",
-                "checkbox_border":"#7DF9FF","checkbox_bg":"#2A173A","checkbox_checked_bg":"#7DF9FF",
+                "checkbox_border":"#FF5E99","checkbox_bg":"#2A173A","checkbox_checked_bg":"#FF5E99",
                 "disabled_bg":"#3A1A1A","disabled_text":"#9E9E9E","disabled_border":"#D6CBA5",
                 "list_bg":"#2A124C","list_selected_bg":"#3A1D66","list_selected_text":"#7DF9FF","list_hover_bg":"#462A61","list_hover_text":"#FDEAFF",
                 "scroll_bg":"#1A0E24","scroll_handle_bg":"#3A1D66","scroll_handle_hover":"#7DF9FF",
@@ -2117,18 +2152,18 @@ class MainWindow(QMainWindow):
             },
             # Ocean Coral (teal base with coral accent)
             "Ocean Coral": {
-                "bg":"#0E2630","text":"#E7FBFF","accent":"#FF6B6B","border":"#4ECDC4",
+                "bg":"#0E2630","text":"#EBFFEF","accent":"#FF6B6B","border":"#4ECDC4",
                 "tab_bg":"#163844","tab_selected_bg":"#1E4B57",
-                "button_bg":"#163844","button_text":"#E7FBFF","button_border":"#4ECDC4",
+                "button_bg":"#163844","button_text":"#EBFFEF","button_border":"#4ECDC4",
                 "surface_hover":"#225B69","surface_alt":"#0B1A12",
-                "input_bg":"#163844","input_text":"#E7FBFF","input_border":"#4ECDC4","selection_bg":"#FF6B6B","focus_bg":"#225B69",
+                "input_bg":"#163844","input_text":"#EBFFEF","input_border":"#4ECDC4","selection_bg":"#FF6B6B","focus_bg":"#225B69",
                 "progress_bg":"#0B1A12","chunk_start":"#4ECDC4","chunk_mid":"#FF6B6B","chunk_end":"#4ECDC4",
                 "checkbox_border":"#FF6B6B","checkbox_bg":"#FFFFFF","checkbox_checked_bg":"#FF6B6B",
                 "disabled_bg":"#25143F","disabled_text":"#BFE5C8","disabled_border":"#28515F",
-                "list_bg":"#163844","list_selected_bg":"#1E4B57","list_selected_text":"#FF6B6B","list_hover_bg":"#1B3A2E","list_hover_text":"#E7FBFF",
+                "list_bg":"#163844","list_selected_bg":"#1E4B57","list_selected_text":"#FF6B6B","list_hover_bg":"#1B3A2E","list_hover_text":"#EBFFEF",
                 "scroll_bg":"#0B1A12","scroll_handle_bg":"#1E4B57","scroll_handle_hover":"#FF6B6B",
-                "menu_bg":"#13281E","menu_text":"#E7FBFF","menu_selected_bg":"#FF6B6B","menu_selected_text":"#163844",
-                "status_bg":"#13281E","status_text":"#E7FBFF","status_border_top":"#FF6B6B",
+                "menu_bg":"#13281E","menu_text":"#EBFFEF","menu_selected_bg":"#FF6B6B","menu_selected_text":"#163844",
+                "status_bg":"#13281E","status_text":"#EBFFEF","status_border_top":"#FF6B6B",
             },
             # Tropical Punch (green/magenta punchy contrast)
             "Tropical Punch": {
