@@ -1,3 +1,5 @@
+![Vion Pulse Splash](https://cdn.nostrcheck.me/46025249f65d47dddb0f17d93eb8b0a32d97fe3189c6684bbd33136a0a7e0424/6f2385127ac22cd3f2483d78ff577bcd7ae887d25a300acc411e653fe1f45df4.webp)
+
 # Vion Pulse Video Converter
 
 A powerful and user-friendly video conversion application built with Python and PyQt6, leveraging FFmpeg for high-quality video processing.
